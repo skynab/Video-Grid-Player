@@ -83,6 +83,10 @@ VIDEO_EXTS = (
 THUMB_W = 320
 THUMB_H = 180
 
+# All title boxes in the grid are pinned to this height so they line up
+# visually, regardless of whether a filename happens to be long or short.
+TITLE_BAR_HEIGHT = 30
+
 
 # ---------------------------------------------------------------------------
 # Thumbnail extraction (runs on a worker thread)
@@ -211,7 +215,7 @@ class OpenFolderDialog(QDialog):
                  show_titles_default: bool = True,
                  rows_default: int = DEFAULT_GRID_ROWS,
                  cols_default: int = DEFAULT_GRID_COLS,
-                 full_width_default: bool = False):
+                 full_width_default: bool = True):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
         self.setFixedSize(540, 430)
@@ -392,7 +396,7 @@ class VideoGridApp(QMainWindow):
         self.show_titles: bool = True     # toggled via the open-folder popup
         self.grid_rows: int = DEFAULT_GRID_ROWS
         self.grid_cols: int = DEFAULT_GRID_COLS
-        self.full_width: bool = False     # edge-to-edge layout with no gaps
+        self.full_width: bool = True      # edge-to-edge layout with no gaps
 
         # Central pages (grid / video) in a stack
         self.stack = QStackedWidget()
@@ -792,9 +796,15 @@ class VideoGridApp(QMainWindow):
             "font-size: 11px; border: none;")
         layout.addWidget(thumb, 1)
 
-        title = QLabel(display_name)
+        # All titles share the same height so the grid looks uniform even
+        # when filenames have very different lengths. Word-wrap is off and
+        # long names are elided with "…" (handled in _set_title_text).
+        title = QLabel()
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setWordWrap(True)
+        title.setWordWrap(False)
+        title.setFixedHeight(TITLE_BAR_HEIGHT)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setProperty("fullText", display_name)
         if self.full_width:
             # In full-width mode, float the title over the thumbnail with a
             # subtle background so it's legible without adding a gap between
@@ -805,49 +815,71 @@ class VideoGridApp(QMainWindow):
                 "border: none;")
             title.setParent(cell)
             title.raise_()
-            # Positioning is handled by _reposition_fullwidth_titles() on
-            # resize / after layout so the overlay stays pinned to the
-            # bottom of each cell.
+            # Positioning is handled by _place_floating_title() on resize /
+            # after layout so the overlay stays pinned to the bottom of
+            # each cell.
         else:
             title.setStyleSheet(
                 "color: white; font-size: 12px; font-weight: bold; "
                 "border: none;")
             layout.addWidget(title)
+        self._set_title_text(title, display_name)
         if not self.show_titles:
             title.hide()
 
         cell.clicked.connect(lambda p=path: self._play_video(p))
 
-        # In full-width mode the title is a floating child widget, so we
-        # have to reposition it every time the cell is resized.
-        if self.full_width:
-            cell.installEventFilter(self)
+        # Install an event filter so we can reposition the floating title
+        # overlay (full-width mode) or re-elide the inline title text
+        # (normal mode) whenever the cell is resized.
+        cell.installEventFilter(self)
 
         return {"cell": cell, "thumb": thumb, "title": title}
 
     def eventFilter(self, obj, event):
-        """Keep floating title overlays pinned to the bottom of their cell
-        in full-width mode whenever the cell is resized or first shown."""
-        if self.full_width and event.type() in (
-                QEvent.Type.Resize, QEvent.Type.Show):
+        """On cell resize: reposition floating titles in full-width mode,
+        and re-elide inline titles in normal mode, so long filenames never
+        overflow and all title bars keep a consistent height."""
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
             for entry in self.cell_widgets:
                 if entry is None:
                     continue
                 if entry["cell"] is obj:
-                    self._place_floating_title(entry)
+                    if self.full_width:
+                        self._place_floating_title(entry)
+                    else:
+                        title = entry["title"]
+                        full = title.property("fullText") or title.text()
+                        self._set_title_text(title, str(full))
                     break
         return super().eventFilter(obj, event)
 
     def _place_floating_title(self, entry: dict) -> None:
         cell = entry["cell"]
         title = entry["title"]
-        if title is None or not title.parent() is cell:
+        if title is None or title.parent() is not cell:
             return
-        # Span the bottom of the cell with a small margin above the edge.
-        hint = title.sizeHint()
-        h = min(max(hint.height(), 22), cell.height())
+        # Span the bottom of the cell at a fixed height so every title bar
+        # in the grid is the same size.
+        h = min(TITLE_BAR_HEIGHT, cell.height())
         title.setGeometry(0, cell.height() - h, cell.width(), h)
         title.raise_()
+        # Re-elide the text to the new width so long filenames don't
+        # overflow the cell.
+        full = title.property("fullText") or title.text()
+        self._set_title_text(title, str(full))
+
+    @staticmethod
+    def _set_title_text(label: "QLabel", text: str) -> None:
+        """Set label text, eliding with "…" if it doesn't fit the label's
+        current width. Called both when the cell is created and whenever
+        the cell is resized."""
+        label.setProperty("fullText", text)
+        fm = label.fontMetrics()
+        # Leave a little breathing room for the label's padding.
+        avail = max(1, label.width() - 16)
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, avail)
+        label.setText(elided)
 
     def _make_empty_cell(self) -> QFrame:
         cell = QFrame()
