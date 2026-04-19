@@ -19,6 +19,38 @@ uncluttered. The popup also lets you:
   * Show or hide the video titles in the grid
   * Choose between a spaced grid layout or a full-width layout with
     no gaps or padding between videos
+  * Optionally use a matching image file next to each video
+    (e.g. `clip.jpg` next to `clip.mp4`) as its grid thumbnail
+
+
+THUMBNAILS
+----------
+You have three ways to get thumbnails in the grid:
+
+  1. Auto-extracted (default)
+     A frame from roughly 10% into each video is decoded on a
+     background thread and shown as the thumbnail.
+
+  2. "Set as Thumbnail" button (during playback)
+     While a video is playing, click the "▣ Set Thumbnail" button in
+     the top-right corner to capture whatever frame is currently on
+     screen and use it as the grid thumbnail for that video. The
+     captured thumbnail is cached per-user (keyed by the video's
+     absolute path) so it sticks around across sessions. The cache
+     lives at:
+       - Windows : %LOCALAPPDATA%\VideoGridPlayer\thumbs
+       - macOS   : ~/.cache/video_grid_player/thumbs
+       - Linux   : ~/.cache/video_grid_player/thumbs
+
+  3. Sidecar image files (opt-in)
+     If you tick "Use matching image files as thumbnails" in the
+     open-folder popup, the app will look for an image file sitting
+     next to each video whose base name matches — e.g. `holiday.jpg`
+     next to `holiday.mp4`. Supported formats: .jpg .jpeg .png
+     .webp .bmp. This option is off by default.
+
+Priority, when deciding which thumbnail to show for a given video:
+  user-set cache  >  sidecar image (if enabled)  >  auto-extracted frame
 
 
 ARCHITECTURE

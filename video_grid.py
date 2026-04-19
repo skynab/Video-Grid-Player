@@ -30,15 +30,18 @@ Dependencies
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 # ---- dependency checks ----------------------------------------------------
 _missing: list[str] = []
 try:
     from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, pyqtSignal
     from PyQt6.QtGui import (
-        QAction, QColor, QImage, QKeySequence, QPalette, QPixmap,
+        QAction, QColor, QImage, QKeySequence, QPainter, QPalette, QPixmap,
     )
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QDialog, QFileDialog, QFrame,
@@ -80,6 +83,10 @@ VIDEO_EXTS = (
     ".wmv", ".flv", ".m4v", ".mpg", ".mpeg", ".ts",
 )
 
+# Image extensions we'll look for when the "sidecar image" thumbnail
+# option is enabled (e.g. `video.jpg` next to `video.mp4`).
+SIDECAR_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
 THUMB_W = 320
 THUMB_H = 180
 
@@ -89,8 +96,63 @@ TITLE_BAR_HEIGHT = 30
 
 
 # ---------------------------------------------------------------------------
+# Thumbnail cache (user-set "use this frame as thumbnail")
+# ---------------------------------------------------------------------------
+def _cache_dir() -> Path:
+    """Per-user cache directory for custom thumbnails that the user has
+    captured via the "Set as Thumbnail" button during playback."""
+    if sys.platform == "win32":
+        base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(base) / "VideoGridPlayer" / "thumbs"
+    return Path.home() / ".cache" / "video_grid_player" / "thumbs"
+
+
+def _cached_thumb_path(video_path: str) -> Path:
+    """Absolute filesystem path where the custom thumbnail for `video_path`
+    is (or would be) stored. Keyed on the absolute video path so moving the
+    video invalidates the cached thumb rather than misusing it."""
+    key = hashlib.sha1(
+        os.path.abspath(video_path).encode("utf-8", "replace")
+    ).hexdigest()
+    return _cache_dir() / (key + ".png")
+
+
+def _find_sidecar_image(video_path: str) -> str | None:
+    """If there's an image file sitting next to `video_path` whose name
+    matches (e.g. `foo.mp4` <-> `foo.jpg`), return its path."""
+    stem = os.path.splitext(video_path)[0]
+    for ext in SIDECAR_IMAGE_EXTS:
+        for candidate in (stem + ext, stem + ext.upper()):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Thumbnail extraction (runs on a worker thread)
 # ---------------------------------------------------------------------------
+def _letterbox_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
+    """Scale an RGB numpy image to fit THUMB_W x THUMB_H, preserving aspect
+    ratio, and paste it centered on a black canvas. Returned QImage is
+    independent of the source numpy buffer (.copy()-d) so it stays alive
+    after the caller lets the array go."""
+    h, w = rgb.shape[:2]
+    scale = min(THUMB_W / w, THUMB_H / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
+    y = (THUMB_H - new_h) // 2
+    x = (THUMB_W - new_w) // 2
+    canvas[y:y + new_h, x:x + new_w] = resized
+
+    return QImage(
+        bytes(canvas.data), THUMB_W, THUMB_H, THUMB_W * 3,
+        QImage.Format.Format_RGB888,
+    ).copy()
+
+
 def extract_thumbnail(path: str) -> "QImage | None":
     """Grab a representative frame from a video and return it as a
     letterboxed QImage of size (THUMB_W x THUMB_H)."""
@@ -113,31 +175,69 @@ def extract_thumbnail(path: str) -> "QImage | None":
         cap.release()
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    scale = min(THUMB_W / w, THUMB_H / h)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return _letterbox_rgb_to_qimage(rgb)
 
-    canvas = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
-    y = (THUMB_H - new_h) // 2
-    x = (THUMB_W - new_w) // 2
-    canvas[y:y + new_h, x:x + new_w] = resized
 
-    # .copy() detaches from the numpy buffer so the QImage survives GC
-    return QImage(
-        bytes(canvas.data), THUMB_W, THUMB_H, THUMB_W * 3,
-        QImage.Format.Format_RGB888,
-    ).copy()
+def load_image_as_thumb_qimage(path: str) -> "QImage | None":
+    """Load an arbitrary image file (jpg/png/webp/bmp/...) and return a
+    letterboxed THUMB_W x THUMB_H QImage suitable for use as a grid thumb.
+    Uses Qt to decode so every image format Qt supports is covered."""
+    src = QImage(path)
+    if src.isNull():
+        return None
+    src = src.convertToFormat(QImage.Format.Format_RGB888)
+    scaled = src.scaled(
+        THUMB_W, THUMB_H,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    canvas = QImage(THUMB_W, THUMB_H, QImage.Format.Format_RGB888)
+    canvas.fill(QColor("black"))
+    painter = QPainter(canvas)
+    x = (THUMB_W - scaled.width()) // 2
+    y = (THUMB_H - scaled.height()) // 2
+    painter.drawImage(x, y, scaled)
+    painter.end()
+    return canvas
+
+
+def load_thumbnail_for_video(
+    path: str, use_sidecar: bool
+) -> "QImage | None":
+    """Decide which thumbnail to show for a given video:
+
+    1. A user-set thumbnail from the cache (captured via the "Set as
+       Thumbnail" button during playback) always wins.
+    2. If the sidecar option is on, try a matching image file sitting
+       next to the video (e.g. `clip.jpg` beside `clip.mp4`).
+    3. Otherwise fall back to extracting a frame from the video itself.
+    """
+    cached = _cached_thumb_path(path)
+    if cached.is_file():
+        img = load_image_as_thumb_qimage(str(cached))
+        if img is not None:
+            return img
+    if use_sidecar:
+        sidecar = _find_sidecar_image(path)
+        if sidecar is not None:
+            img = load_image_as_thumb_qimage(sidecar)
+            if img is not None:
+                return img
+    return extract_thumbnail(path)
 
 
 class ThumbnailWorker(QThread):
-    """Extract thumbnails for a list of paths off the GUI thread."""
+    """Resolve thumbnails for a list of paths off the GUI thread.
+
+    For each video we first check the user-set cache, then (optionally) a
+    matching sidecar image, then fall back to decoding a frame from the
+    video itself."""
     thumbnail_ready = pyqtSignal(int, str, QImage)
 
-    def __init__(self, paths: list[str]):
+    def __init__(self, paths: list[str], use_sidecar: bool = False):
         super().__init__()
         self._paths = paths
+        self._use_sidecar = use_sidecar
         self._stop = False
 
     def stop(self) -> None:
@@ -148,7 +248,7 @@ class ThumbnailWorker(QThread):
             if self._stop:
                 return
             try:
-                img = extract_thumbnail(path)
+                img = load_thumbnail_for_video(path, self._use_sidecar)
             except Exception as exc:
                 print(f"[thumbnail] error for {path!r}: {exc}")
                 img = None
@@ -215,16 +315,18 @@ class OpenFolderDialog(QDialog):
                  show_titles_default: bool = True,
                  rows_default: int = DEFAULT_GRID_ROWS,
                  cols_default: int = DEFAULT_GRID_COLS,
-                 full_width_default: bool = True):
+                 full_width_default: bool = True,
+                 use_sidecar_default: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(540, 430)
+        self.setFixedSize(580, 480)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
         self.grid_rows: int = rows_default
         self.grid_cols: int = cols_default
         self.full_width: bool = full_width_default
+        self.use_sidecar: bool = use_sidecar_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -323,6 +425,17 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.full_width_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
+        root.addSpacing(8)
+
+        self.sidecar_checkbox = QCheckBox(
+            "Use matching image files as thumbnails "
+            "(e.g. video.jpg next to video.mp4)")
+        self.sidecar_checkbox.setChecked(use_sidecar_default)
+        self.sidecar_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidecar_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.sidecar_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
         root.addStretch(1)
 
         # --- buttons ------------------------------------------------------
@@ -361,6 +474,7 @@ class OpenFolderDialog(QDialog):
             self.grid_rows = self.rows_spin.value()
             self.grid_cols = self.cols_spin.value()
             self.full_width = self.full_width_checkbox.isChecked()
+            self.use_sidecar = self.sidecar_checkbox.isChecked()
             self.accept()
 
 
@@ -397,6 +511,9 @@ class VideoGridApp(QMainWindow):
         self.grid_rows: int = DEFAULT_GRID_ROWS
         self.grid_cols: int = DEFAULT_GRID_COLS
         self.full_width: bool = True      # edge-to-edge layout with no gaps
+        self.use_sidecar_thumbnails: bool = False  # use foo.jpg next to foo.mp4
+        self.current_video_path: str | None = None
+        self.current_video_idx: int | None = None
 
         # Central pages (grid / video) in a stack
         self.stack = QStackedWidget()
@@ -405,6 +522,7 @@ class VideoGridApp(QMainWindow):
         self._build_grid_page()
         self._build_video_page()
         self._build_close_overlay()
+        self._build_set_thumb_overlay()
         self._build_jog_overlay()
         self.stack.setCurrentWidget(self.grid_page)
 
@@ -509,6 +627,56 @@ class VideoGridApp(QMainWindow):
         y = margin
         self.close_button.move(max(0, x), max(0, y))
         self.close_button.raise_()
+
+    # ---------------------------------------------- "Set Thumbnail" overlay --
+    def _build_set_thumb_overlay(self) -> None:
+        """A pill-shaped button overlaid on the top-right of the video that
+        captures the current frame and uses it as the grid thumbnail for
+        the video being played. It sits just to the left of the ✕ button.
+        """
+        self.set_thumb_button = QPushButton("\u25A3  Set Thumbnail", self)
+        self.set_thumb_button.setObjectName("setThumbOverlay")
+        self.set_thumb_button.setFixedHeight(40)
+        self.set_thumb_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.set_thumb_button.setToolTip(
+            "Use the current frame as this video's grid thumbnail")
+        self.set_thumb_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.set_thumb_button.setAttribute(
+            Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.set_thumb_button.setStyleSheet(
+            "#setThumbOverlay {"
+            "  background-color: rgba(0, 0, 0, 170);"
+            "  color: white;"
+            "  border: 2px solid rgba(255, 255, 255, 90);"
+            "  border-radius: 20px;"
+            "  font-size: 13px;"
+            "  font-weight: bold;"
+            "  padding: 0 18px;"
+            "}"
+            "#setThumbOverlay:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "  border: 2px solid rgba(255, 255, 255, 180);"
+            "}"
+            "#setThumbOverlay:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.set_thumb_button.clicked.connect(
+            self._capture_current_frame_as_thumbnail)
+        self.set_thumb_button.hide()
+
+    def _position_set_thumb_button(self) -> None:
+        """Pin the 'Set Thumbnail' button just to the left of the ✕ button."""
+        margin = 20
+        gap = 12
+        self.set_thumb_button.adjustSize()
+        # adjustSize() respects text width but we forced a fixed height earlier.
+        self.set_thumb_button.setFixedHeight(40)
+        x = (self.close_button.x()
+             - self.set_thumb_button.width() - gap)
+        y = margin + (self.close_button.height() - 40) // 2
+        self.set_thumb_button.move(max(0, x), max(0, y))
+        self.set_thumb_button.raise_()
 
     # ------------------------------------------------ jog / transport bar --
     def _build_jog_overlay(self) -> None:
@@ -661,12 +829,14 @@ class VideoGridApp(QMainWindow):
             rows_default=self.grid_rows,
             cols_default=self.grid_cols,
             full_width_default=self.full_width,
+            use_sidecar_default=self.use_sidecar_thumbnails,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
             self.grid_rows = dlg.grid_rows
             self.grid_cols = dlg.grid_cols
             self.full_width = dlg.full_width
+            self.use_sidecar_thumbnails = dlg.use_sidecar
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -698,7 +868,10 @@ class VideoGridApp(QMainWindow):
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
-        self.thumb_worker = ThumbnailWorker(list(self.video_files))
+        self.thumb_worker = ThumbnailWorker(
+            list(self.video_files),
+            use_sidecar=self.use_sidecar_thumbnails,
+        )
         self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail)
         self.thumb_worker.start()
 
@@ -906,6 +1079,11 @@ class VideoGridApp(QMainWindow):
         if self.is_playing:
             return
         self.is_playing = True
+        self.current_video_path = path
+        try:
+            self.current_video_idx = self.video_files.index(path)
+        except ValueError:
+            self.current_video_idx = None
 
         # Switch to the video page so the surface is laid out & visible,
         # then go fullscreen, then give Qt one event-loop tick so the
@@ -939,6 +1117,14 @@ class VideoGridApp(QMainWindow):
         self.close_button.show()
         self.close_button.raise_()
 
+        # Reset the "Set Thumbnail" button label in case it was showing
+        # the "✓ Thumbnail Set" confirmation from a previous play, then
+        # show it to the left of the ✕ button.
+        self.set_thumb_button.setText("\u25A3  Set Thumbnail")
+        self._position_set_thumb_button()
+        self.set_thumb_button.show()
+        self.set_thumb_button.raise_()
+
         # Reset and reveal the jog/transport bar
         self.timeline.blockSignals(True)
         self.timeline.setValue(0)
@@ -950,6 +1136,84 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.raise_()
         self.position_timer.start()
 
+    def _capture_current_frame_as_thumbnail(self) -> None:
+        """Snapshot whatever VLC is currently showing and use it as the
+        grid thumbnail for the video being played. The PNG is cached in
+        a per-user directory keyed on the video's absolute path, so the
+        custom thumbnail is still there next time this folder is opened.
+        """
+        if not self.is_playing or self.current_video_path is None:
+            return
+
+        # Make sure the cache dir exists before we write into it.
+        cache_dir = _cache_dir()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Set Thumbnail",
+                f"Couldn't create thumbnail cache directory:\n{exc}")
+            return
+
+        # Have VLC write the current frame to a temp PNG. Using a temp
+        # file first avoids leaving a half-written cache entry behind if
+        # anything goes wrong mid-write; we move it into place on success.
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".png", prefix="vgp_snap_")
+        os.close(tmp_fd)
+        rc = -1
+        try:
+            rc = self.player.video_take_snapshot(0, tmp_path, 0, 0)
+        except Exception as exc:
+            print(f"[snapshot] VLC error: {exc}")
+
+        if rc != 0 or (not os.path.isfile(tmp_path)
+                       or os.path.getsize(tmp_path) == 0):
+            # Snapshot failed (VLC not ready, video output not available,
+            # etc.). Clean up the empty temp file and bail out.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            QMessageBox.warning(
+                self, "Set Thumbnail",
+                "Couldn't capture the current frame. "
+                "Try again a moment after playback begins.")
+            return
+
+        # Load the snapshot, letterbox it to our standard thumb size,
+        # and persist it to the cache as <sha1(path)>.png.
+        thumb_qimg = load_image_as_thumb_qimage(tmp_path)
+        dest = _cached_thumb_path(self.current_video_path)
+        try:
+            os.replace(tmp_path, dest)
+        except OSError as exc:
+            print(f"[snapshot] could not move to cache: {exc}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        if thumb_qimg is None:
+            return
+
+        # Update the live grid cell so the new thumbnail appears as soon
+        # as the user returns to the grid.
+        pixmap = QPixmap.fromImage(thumb_qimg)
+        self.thumbnails[self.current_video_path] = pixmap
+        idx = self.current_video_idx
+        if (idx is not None and 0 <= idx < len(self.cell_widgets)
+                and self.cell_widgets[idx] is not None):
+            entry = self.cell_widgets[idx]
+            entry["thumb"].setPixmap(pixmap)
+            entry["thumb"].setText("")
+
+        # Brief on-screen confirmation so the user knows it worked.
+        self.set_thumb_button.setText("\u2713  Thumbnail Set")
+        QTimer.singleShot(
+            1400,
+            lambda: self.set_thumb_button.setText("\u25A3  Set Thumbnail"))
+
     def _on_vlc_end(self, _event) -> None:
         # Fires on VLC's thread — defer UI updates to the Qt main loop
         QTimer.singleShot(80, self._stop_playback)
@@ -960,11 +1224,14 @@ class VideoGridApp(QMainWindow):
         self.is_playing = False
         self.position_timer.stop()
         self.close_button.hide()
+        self.set_thumb_button.hide()
         self.jog_bar.hide()
         try:
             self.player.stop()
         except Exception:
             pass
+        self.current_video_path = None
+        self.current_video_idx = None
         self.showNormal()
         self.stack.setCurrentWidget(self.grid_page)
 
@@ -989,6 +1256,9 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "close_button", None) is not None \
                 and self.close_button.isVisible():
             self._position_close_button()
+        if getattr(self, "set_thumb_button", None) is not None \
+                and self.set_thumb_button.isVisible():
+            self._position_set_thumb_button()
         if getattr(self, "jog_bar", None) is not None \
                 and self.jog_bar.isVisible():
             self._position_jog_bar()
@@ -998,13 +1268,16 @@ class VideoGridApp(QMainWindow):
         QMessageBox.information(
             self, "About Video Grid Player",
             "Video Grid Player\n\n"
-            "Displays up to 12 videos in a 4 × 3 grid with thumbnails. "
-            "Click a cell to play the video fullscreen inside the app.\n\n"
+            "Displays your videos in a configurable grid (up to 6×6) with "
+            "thumbnails. Click a cell to play the video fullscreen inside "
+            "the app.\n\n"
             "Controls while playing:\n"
-            "  • Esc           return to grid (or click the ✕ button)\n"
-            "  • Space         pause / resume\n"
-            "  • ← / →         skip 5 seconds back / forward\n"
-            "  • Click / drag  on the bottom timeline to scrub\n\n"
+            "  • Esc            return to grid (or click the ✕ button)\n"
+            "  • Space          pause / resume\n"
+            "  • ← / →          skip 5 seconds back / forward\n"
+            "  • Click / drag   on the bottom timeline to scrub\n"
+            "  • Set Thumbnail  capture the current frame as this "
+            "video's grid thumbnail\n\n"
             "Built with Python, PyQt6, python-vlc, and OpenCV.")
 
     def closeEvent(self, event):
