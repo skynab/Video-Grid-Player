@@ -21,6 +21,9 @@ uncluttered. The popup also lets you:
     no gaps or padding between videos
   * Optionally use a matching image file next to each video
     (e.g. `clip.jpg` next to `clip.mp4`) as its grid thumbnail
+  * Pick how thumbnails fill their grid cells: either stretch to fit
+    (distorts aspect ratio) or preserve aspect ratio and clip any
+    overflow
 
 
 THUMBNAILS

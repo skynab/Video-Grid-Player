@@ -94,6 +94,14 @@ THUMB_H = 180
 # visually, regardless of whether a filename happens to be long or short.
 TITLE_BAR_HEIGHT = 30
 
+# How a thumbnail image should be rendered inside its grid cell.
+# FIT_STRETCH stretches the image to completely fill the cell (ignoring
+# the source's aspect ratio — this is the original behavior).
+# FIT_CLIP scales the image to cover the cell while preserving the
+# source's aspect ratio; any overflow is clipped.
+FIT_STRETCH = "stretch"
+FIT_CLIP = "clip"
+
 
 # ---------------------------------------------------------------------------
 # Thumbnail cache (user-set "use this frame as thumbnail")
@@ -131,24 +139,20 @@ def _find_sidecar_image(video_path: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Thumbnail extraction (runs on a worker thread)
 # ---------------------------------------------------------------------------
-def _letterbox_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
-    """Scale an RGB numpy image to fit THUMB_W x THUMB_H, preserving aspect
-    ratio, and paste it centered on a black canvas. Returned QImage is
-    independent of the source numpy buffer (.copy()-d) so it stays alive
-    after the caller lets the array go."""
+def _fit_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
+    """Scale an RGB numpy image to fit within THUMB_W x THUMB_H while
+    preserving aspect ratio, and return a QImage of exactly the scaled
+    size (no letterbox / padding). The display widget decides later
+    whether to stretch this to fill the cell or to scale-and-clip it."""
     h, w = rgb.shape[:2]
     scale = min(THUMB_W / w, THUMB_H / h)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    canvas = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
-    y = (THUMB_H - new_h) // 2
-    x = (THUMB_W - new_w) // 2
-    canvas[y:y + new_h, x:x + new_w] = resized
-
+    # tobytes() gives us a detached buffer so the returned QImage is safe
+    # to keep around after the numpy array is freed.
     return QImage(
-        bytes(canvas.data), THUMB_W, THUMB_H, THUMB_W * 3,
+        resized.tobytes(), new_w, new_h, new_w * 3,
         QImage.Format.Format_RGB888,
     ).copy()
 
@@ -175,30 +179,23 @@ def extract_thumbnail(path: str) -> "QImage | None":
         cap.release()
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return _letterbox_rgb_to_qimage(rgb)
+    return _fit_rgb_to_qimage(rgb)
 
 
 def load_image_as_thumb_qimage(path: str) -> "QImage | None":
     """Load an arbitrary image file (jpg/png/webp/bmp/...) and return a
-    letterboxed THUMB_W x THUMB_H QImage suitable for use as a grid thumb.
-    Uses Qt to decode so every image format Qt supports is covered."""
+    QImage scaled to fit within THUMB_W x THUMB_H while preserving aspect
+    ratio. No padding is added — the display widget is responsible for
+    deciding whether to stretch or clip the image inside its cell."""
     src = QImage(path)
     if src.isNull():
         return None
     src = src.convertToFormat(QImage.Format.Format_RGB888)
-    scaled = src.scaled(
+    return src.scaled(
         THUMB_W, THUMB_H,
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
-    canvas = QImage(THUMB_W, THUMB_H, QImage.Format.Format_RGB888)
-    canvas.fill(QColor("black"))
-    painter = QPainter(canvas)
-    x = (THUMB_W - scaled.width()) // 2
-    y = (THUMB_H - scaled.height()) // 2
-    painter.drawImage(x, y, scaled)
-    painter.end()
-    return canvas
 
 
 def load_thumbnail_for_video(
@@ -286,6 +283,63 @@ class SeekSlider(QSlider):
             self.seek_to.emit(self.value())
 
 
+class ThumbnailLabel(QLabel):
+    """A QLabel that can render its pixmap in two different modes:
+
+    * FIT_STRETCH - stretch the pixmap to fill the label, ignoring the
+      source's aspect ratio. This matches QLabel's usual
+      setScaledContents(True) behavior.
+    * FIT_CLIP    - scale the pixmap to cover the label while preserving
+      aspect ratio; any overflow on the major axis is clipped.
+
+    While no pixmap is set (e.g. while thumbnails are still loading),
+    painting falls back to the default QLabel rendering so placeholder
+    text like "Loading thumbnail…" still shows up."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fit_mode: str = FIT_STRETCH
+        self._src_pixmap: "QPixmap | None" = None
+
+    def set_fit_mode(self, mode: str) -> None:
+        self._fit_mode = mode
+        self.update()
+
+    def setPixmap(self, pixmap: "QPixmap") -> None:
+        # We store the source and do all the rendering ourselves in
+        # paintEvent, so deliberately don't forward to super().setPixmap
+        # — otherwise QLabel would also try to draw the pixmap at its
+        # natural size.
+        if pixmap is None or pixmap.isNull():
+            self._src_pixmap = None
+        else:
+            self._src_pixmap = pixmap
+        self.update()
+
+    def clear(self) -> None:
+        self._src_pixmap = None
+        super().clear()
+
+    def paintEvent(self, event):
+        # No pixmap yet — let QLabel handle text / placeholder painting.
+        if self._src_pixmap is None or self._src_pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        aspect = (Qt.AspectRatioMode.IgnoreAspectRatio
+                  if self._fit_mode == FIT_STRETCH
+                  else Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        scaled = self._src_pixmap.scaled(
+            self.size(),
+            aspect,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+
+
 class ClickableCell(QFrame):
     """A frame that emits `clicked` when left-clicked."""
     clicked = pyqtSignal()
@@ -316,10 +370,12 @@ class OpenFolderDialog(QDialog):
                  rows_default: int = DEFAULT_GRID_ROWS,
                  cols_default: int = DEFAULT_GRID_COLS,
                  full_width_default: bool = True,
-                 use_sidecar_default: bool = False):
+                 use_sidecar_default: bool = False,
+                 thumbnail_fit_default: str = FIT_STRETCH,
+                 show_set_thumb_default: bool = True):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(580, 480)
+        self.setFixedSize(600, 560)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -327,6 +383,8 @@ class OpenFolderDialog(QDialog):
         self.grid_cols: int = cols_default
         self.full_width: bool = full_width_default
         self.use_sidecar: bool = use_sidecar_default
+        self.thumbnail_fit: str = thumbnail_fit_default
+        self.show_set_thumb_button: bool = show_set_thumb_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -436,6 +494,29 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.sidecar_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
+        root.addSpacing(8)
+
+        self.clip_thumb_checkbox = QCheckBox(
+            "Preserve thumbnail aspect ratio "
+            "(clip to fit instead of stretching)")
+        self.clip_thumb_checkbox.setChecked(
+            thumbnail_fit_default == FIT_CLIP)
+        self.clip_thumb_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clip_thumb_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.clip_thumb_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(8)
+
+        self.set_thumb_button_checkbox = QCheckBox(
+            "Show \u201cSet Thumbnail\u201d button while a video is playing")
+        self.set_thumb_button_checkbox.setChecked(show_set_thumb_default)
+        self.set_thumb_button_checkbox.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.set_thumb_button_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.set_thumb_button_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
         root.addStretch(1)
 
         # --- buttons ------------------------------------------------------
@@ -475,6 +556,11 @@ class OpenFolderDialog(QDialog):
             self.grid_cols = self.cols_spin.value()
             self.full_width = self.full_width_checkbox.isChecked()
             self.use_sidecar = self.sidecar_checkbox.isChecked()
+            self.thumbnail_fit = (
+                FIT_CLIP if self.clip_thumb_checkbox.isChecked()
+                else FIT_STRETCH)
+            self.show_set_thumb_button = (
+                self.set_thumb_button_checkbox.isChecked())
             self.accept()
 
 
@@ -500,6 +586,10 @@ class VideoGridApp(QMainWindow):
                         self._on_vlc_end)
         em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
                         self._on_vlc_end)
+        em.event_attach(vlc.EventType.MediaPlayerPaused,
+                        self._on_vlc_paused)
+        em.event_attach(vlc.EventType.MediaPlayerPlaying,
+                        self._on_vlc_playing)
 
         # State
         self.video_files: list[str] = []
@@ -512,6 +602,8 @@ class VideoGridApp(QMainWindow):
         self.grid_cols: int = DEFAULT_GRID_COLS
         self.full_width: bool = True      # edge-to-edge layout with no gaps
         self.use_sidecar_thumbnails: bool = False  # use foo.jpg next to foo.mp4
+        self.thumbnail_fit: str = FIT_STRETCH     # how thumbnails fill cells
+        self.show_set_thumb_button: bool = True   # show/hide overlay button
         self.current_video_path: str | None = None
         self.current_video_idx: int | None = None
 
@@ -698,6 +790,37 @@ class VideoGridApp(QMainWindow):
         bar_layout.setContentsMargins(18, 10, 18, 10)
         bar_layout.setSpacing(14)
 
+        # Pause / resume button — lives at the left end of the transport
+        # bar. Uses Unicode media glyphs (⏸ / ▶) so we don't need an icon
+        # file. The button toggles VLC's paused state; its label is also
+        # kept in sync with VLC via MediaPlayerPaused/Playing events so it
+        # still reflects reality when Space is used instead.
+        self.pause_button = QPushButton("\u23F8")
+        self.pause_button.setObjectName("pauseBtn")
+        self.pause_button.setFixedSize(36, 36)
+        self.pause_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pause_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pause_button.setToolTip("Pause / resume (Space)")
+        self.pause_button.setStyleSheet(
+            "#pauseBtn {"
+            "  background-color: rgba(255, 255, 255, 30);"
+            "  color: white;"
+            "  border: 1px solid rgba(255, 255, 255, 100);"
+            "  border-radius: 18px;"
+            "  font-size: 15px;"
+            "  padding: 0;"
+            "}"
+            "#pauseBtn:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "  border: 1px solid rgba(255, 255, 255, 180);"
+            "}"
+            "#pauseBtn:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.pause_button.clicked.connect(self._toggle_pause)
+        bar_layout.addWidget(self.pause_button)
+
         self.time_current = QLabel("0:00")
         self.time_current.setStyleSheet(
             "color: white; font-size: 12px; font-family: monospace; "
@@ -830,6 +953,8 @@ class VideoGridApp(QMainWindow):
             cols_default=self.grid_cols,
             full_width_default=self.full_width,
             use_sidecar_default=self.use_sidecar_thumbnails,
+            thumbnail_fit_default=self.thumbnail_fit,
+            show_set_thumb_default=self.show_set_thumb_button,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -837,6 +962,8 @@ class VideoGridApp(QMainWindow):
             self.grid_cols = dlg.grid_cols
             self.full_width = dlg.full_width
             self.use_sidecar_thumbnails = dlg.use_sidecar
+            self.thumbnail_fit = dlg.thumbnail_fit
+            self.show_set_thumb_button = dlg.show_set_thumb_button
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -955,15 +1082,17 @@ class VideoGridApp(QMainWindow):
             layout.setContentsMargins(10, 10, 10, 10)
             layout.setSpacing(8)
 
-        thumb = QLabel("Loading thumbnail…")
+        # ThumbnailLabel renders the pixmap in either FIT_STRETCH (distort
+        # to fill) or FIT_CLIP (keep aspect ratio, clip to fill) — the
+        # mode is chosen by the user in the open-folder popup.
+        thumb = ThumbnailLabel()
+        thumb.setText("Loading thumbnail…")
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.set_fit_mode(self.thumbnail_fit)
         if self.full_width:
-            # Let the thumbnail stretch to fill the entire cell edge-to-edge.
             thumb.setMinimumSize(1, 1)
-            thumb.setScaledContents(True)
         else:
             thumb.setMinimumSize(THUMB_W, THUMB_H)
-            thumb.setScaledContents(False)
         thumb.setStyleSheet(
             "background: black; color: #777777; "
             "font-size: 11px; border: none;")
@@ -1119,11 +1248,15 @@ class VideoGridApp(QMainWindow):
 
         # Reset the "Set Thumbnail" button label in case it was showing
         # the "✓ Thumbnail Set" confirmation from a previous play, then
-        # show it to the left of the ✕ button.
+        # show it to the left of the ✕ button — but only if the user has
+        # the "Show Set Thumbnail button" option enabled in the popup.
         self.set_thumb_button.setText("\u25A3  Set Thumbnail")
-        self._position_set_thumb_button()
-        self.set_thumb_button.show()
-        self.set_thumb_button.raise_()
+        if self.show_set_thumb_button:
+            self._position_set_thumb_button()
+            self.set_thumb_button.show()
+            self.set_thumb_button.raise_()
+        else:
+            self.set_thumb_button.hide()
 
         # Reset and reveal the jog/transport bar
         self.timeline.blockSignals(True)
@@ -1131,6 +1264,7 @@ class VideoGridApp(QMainWindow):
         self.timeline.blockSignals(False)
         self.time_current.setText("0:00")
         self.time_total.setText("0:00")
+        self._set_pause_button_state(paused=False)
         self._position_jog_bar()
         self.jog_bar.show()
         self.jog_bar.raise_()
@@ -1214,6 +1348,39 @@ class VideoGridApp(QMainWindow):
             1400,
             lambda: self.set_thumb_button.setText("\u25A3  Set Thumbnail"))
 
+    def _toggle_pause(self) -> None:
+        """Toggle VLC's paused state and refresh the button label."""
+        if not self.is_playing:
+            return
+        try:
+            self.player.pause()      # libvlc's pause() is a toggle
+        except Exception:
+            pass
+        # Optimistically flip the label right away so the button feels
+        # responsive. The VLC Paused/Playing events will fire shortly
+        # after and confirm (or correct) the state.
+        if self.pause_button.text() == "\u23F8":
+            self._set_pause_button_state(paused=True)
+        else:
+            self._set_pause_button_state(paused=False)
+
+    def _set_pause_button_state(self, paused: bool) -> None:
+        if paused:
+            self.pause_button.setText("\u25B6")        # ▶
+            self.pause_button.setToolTip("Resume (Space)")
+        else:
+            self.pause_button.setText("\u23F8")        # ⏸
+            self.pause_button.setToolTip("Pause (Space)")
+
+    def _on_vlc_paused(self, _event) -> None:
+        # VLC events fire on VLC's thread — bounce back to the GUI thread.
+        QTimer.singleShot(
+            0, lambda: self._set_pause_button_state(paused=True))
+
+    def _on_vlc_playing(self, _event) -> None:
+        QTimer.singleShot(
+            0, lambda: self._set_pause_button_state(paused=False))
+
     def _on_vlc_end(self, _event) -> None:
         # Fires on VLC's thread — defer UI updates to the Qt main loop
         QTimer.singleShot(80, self._stop_playback)
@@ -1241,7 +1408,7 @@ class VideoGridApp(QMainWindow):
         if self.is_playing and key == Qt.Key.Key_Escape:
             self._stop_playback()
         elif self.is_playing and key == Qt.Key.Key_Space:
-            self.player.pause()
+            self._toggle_pause()
         elif self.is_playing and key == Qt.Key.Key_Left:
             self._seek_relative(-5000)        # back 5 seconds
         elif self.is_playing and key == Qt.Key.Key_Right:
