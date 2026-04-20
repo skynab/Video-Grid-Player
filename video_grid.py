@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import sys
 import tempfile
 from pathlib import Path
@@ -393,10 +394,11 @@ class OpenFolderDialog(QDialog):
                  use_sidecar_default: bool = False,
                  thumbnail_fit_default: str = FIT_STRETCH,
                  show_set_thumb_default: bool = True,
-                 auto_hide_default: bool = False):
+                 auto_hide_default: bool = False,
+                 shuffle_default: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(620, 600)
+        self.setFixedSize(640, 650)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -407,6 +409,7 @@ class OpenFolderDialog(QDialog):
         self.thumbnail_fit: str = thumbnail_fit_default
         self.show_set_thumb_button: bool = show_set_thumb_default
         self.auto_hide_overlays: bool = auto_hide_default
+        self.shuffle_play: bool = shuffle_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -549,6 +552,16 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.auto_hide_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
+        root.addSpacing(8)
+
+        self.shuffle_checkbox = QCheckBox(
+            "Shuffle \u2014 play a random video when the current one ends")
+        self.shuffle_checkbox.setChecked(shuffle_default)
+        self.shuffle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shuffle_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.shuffle_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
         root.addStretch(1)
 
         # --- buttons ------------------------------------------------------
@@ -594,6 +607,7 @@ class OpenFolderDialog(QDialog):
             self.show_set_thumb_button = (
                 self.set_thumb_button_checkbox.isChecked())
             self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
+            self.shuffle_play = self.shuffle_checkbox.isChecked()
             self.accept()
 
 
@@ -639,6 +653,7 @@ class VideoGridApp(QMainWindow):
         self.show_set_thumb_button: bool = True   # show/hide overlay button
         self.auto_hide_overlays: bool = False     # auto-hide after 5 seconds
         self._overlays_hidden: bool = False       # current hide/show state
+        self.shuffle_play: bool = False           # play random next on end
         self.current_video_path: str | None = None
         self.current_video_idx: int | None = None
 
@@ -1140,6 +1155,7 @@ class VideoGridApp(QMainWindow):
             thumbnail_fit_default=self.thumbnail_fit,
             show_set_thumb_default=self.show_set_thumb_button,
             auto_hide_default=self.auto_hide_overlays,
+            shuffle_default=self.shuffle_play,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -1150,6 +1166,7 @@ class VideoGridApp(QMainWindow):
             self.thumbnail_fit = dlg.thumbnail_fit
             self.show_set_thumb_button = dlg.show_set_thumb_button
             self.auto_hide_overlays = dlg.auto_hide_overlays
+            self.shuffle_play = dlg.shuffle_play
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -1582,7 +1599,58 @@ class VideoGridApp(QMainWindow):
 
     def _on_vlc_end(self, _event) -> None:
         # Fires on VLC's thread — defer UI updates to the Qt main loop
-        QTimer.singleShot(80, self._stop_playback)
+        QTimer.singleShot(80, self._handle_video_ended)
+
+    def _handle_video_ended(self) -> None:
+        """Called on the GUI thread when the currently-playing video ends
+        (or errors out). If shuffle is enabled, pick a random next video
+        and continue playing. Otherwise return to the grid."""
+        if (self.shuffle_play
+                and self.is_playing
+                and len(self.video_files) >= 1):
+            self._play_next_shuffled()
+        else:
+            self._stop_playback()
+
+    def _play_next_shuffled(self) -> None:
+        """Pick a random video from the loaded list (avoiding the one that
+        just finished if we have more than one) and start it without
+        returning to the grid. Preserves the current hide/show state of
+        the overlays so a shuffle session can stay "clean" if the user
+        has collapsed the controls."""
+        current = self.current_video_path
+        choices = [v for v in self.video_files if v != current]
+        if not choices:
+            choices = list(self.video_files)
+        if not choices:
+            self._stop_playback()
+            return
+
+        next_path = random.choice(choices)
+        was_hidden = self._overlays_hidden
+
+        # Tear down timers / VLC state tied to the outgoing video, but
+        # keep is_playing=True and stay on the video page / fullscreen.
+        self.position_timer.stop()
+        self.auto_hide_timer.stop()
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+
+        self.current_video_path = next_path
+        try:
+            self.current_video_idx = self.video_files.index(next_path)
+        except ValueError:
+            self.current_video_idx = None
+
+        # Kick off the new video through the same path as a fresh play.
+        QTimer.singleShot(
+            60, lambda p=next_path: self._begin_vlc_playback(p))
+        # _begin_vlc_playback unconditionally re-shows the overlays;
+        # if the user had them collapsed, re-hide after things settle.
+        if was_hidden:
+            QTimer.singleShot(140, self._hide_overlays)
 
     def _stop_playback(self) -> None:
         if not self.is_playing:
