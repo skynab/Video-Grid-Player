@@ -372,10 +372,11 @@ class OpenFolderDialog(QDialog):
                  full_width_default: bool = True,
                  use_sidecar_default: bool = False,
                  thumbnail_fit_default: str = FIT_STRETCH,
-                 show_set_thumb_default: bool = True):
+                 show_set_thumb_default: bool = True,
+                 auto_hide_default: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(600, 560)
+        self.setFixedSize(620, 600)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -385,6 +386,7 @@ class OpenFolderDialog(QDialog):
         self.use_sidecar: bool = use_sidecar_default
         self.thumbnail_fit: str = thumbnail_fit_default
         self.show_set_thumb_button: bool = show_set_thumb_default
+        self.auto_hide_overlays: bool = auto_hide_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -517,6 +519,16 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.set_thumb_button_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
+        root.addSpacing(8)
+
+        self.auto_hide_checkbox = QCheckBox(
+            "Auto-hide on-screen controls after 5 seconds of playback")
+        self.auto_hide_checkbox.setChecked(auto_hide_default)
+        self.auto_hide_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_hide_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.auto_hide_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
         root.addStretch(1)
 
         # --- buttons ------------------------------------------------------
@@ -561,6 +573,7 @@ class OpenFolderDialog(QDialog):
                 else FIT_STRETCH)
             self.show_set_thumb_button = (
                 self.set_thumb_button_checkbox.isChecked())
+            self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
             self.accept()
 
 
@@ -604,6 +617,8 @@ class VideoGridApp(QMainWindow):
         self.use_sidecar_thumbnails: bool = False  # use foo.jpg next to foo.mp4
         self.thumbnail_fit: str = FIT_STRETCH     # how thumbnails fill cells
         self.show_set_thumb_button: bool = True   # show/hide overlay button
+        self.auto_hide_overlays: bool = False     # auto-hide after 5 seconds
+        self._overlays_hidden: bool = False       # current hide/show state
         self.current_video_path: str | None = None
         self.current_video_idx: int | None = None
 
@@ -616,6 +631,8 @@ class VideoGridApp(QMainWindow):
         self._build_close_overlay()
         self._build_set_thumb_overlay()
         self._build_jog_overlay()
+        self._build_overlay_toggle()
+        self._build_auto_hide_timer()
         self.stack.setCurrentWidget(self.grid_page)
 
         self._render_grid()
@@ -692,6 +709,12 @@ class VideoGridApp(QMainWindow):
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.close_button.setAttribute(
             Qt.WidgetAttribute.WA_NativeWindow, True)
+        # Make the native surface translucent so only the rounded button
+        # shape is painted — otherwise the native window is opaque black
+        # and you see a rectangle around the circular button.
+        self.close_button.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.close_button.setAutoFillBackground(False)
         self.close_button.setStyleSheet(
             "#closeOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -878,7 +901,9 @@ class VideoGridApp(QMainWindow):
     def _position_jog_bar(self) -> None:
         """Pin the transport bar to the bottom-center of the window."""
         margin_x = 40
-        margin_y = 32
+        # Leave enough room below the jog bar for the chevron toggle to
+        # sit "under the timeline" without falling off the screen.
+        margin_y = 52
         bar_height = 56
         bar_width = max(360, self.width() - 2 * margin_x)
         self.jog_bar.setFixedHeight(bar_height)
@@ -887,6 +912,120 @@ class VideoGridApp(QMainWindow):
         y = self.height() - bar_height - margin_y
         self.jog_bar.move(max(0, x), max(0, y))
         self.jog_bar.raise_()
+
+    # ------------------------------------------ chevron hide/show toggle --
+    def _build_overlay_toggle(self) -> None:
+        """A small pill-shaped button anchored just below the timeline.
+        Pressing it hides every on-screen control (timeline, pause, close,
+        "Set Thumbnail") leaving only this button visible, which now shows
+        an up-chevron so it can restore the controls on the next press."""
+        self.overlay_toggle = QPushButton("\u25BE", self)   # ▾
+        self.overlay_toggle.setObjectName("overlayToggle")
+        self.overlay_toggle.setFixedSize(56, 28)
+        self.overlay_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.overlay_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self.overlay_toggle.setAttribute(
+            Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.overlay_toggle.setStyleSheet(
+            "#overlayToggle {"
+            "  background-color: rgba(0, 0, 0, 170);"
+            "  color: white;"
+            "  border: 1px solid rgba(255, 255, 255, 90);"
+            "  border-radius: 14px;"
+            "  font-size: 16px;"
+            "  font-weight: bold;"
+            "  padding: 0;"
+            "}"
+            "#overlayToggle:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "  border: 1px solid rgba(255, 255, 255, 180);"
+            "}"
+            "#overlayToggle:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.overlay_toggle.clicked.connect(self._toggle_overlays)
+        self.overlay_toggle.hide()
+
+    def _position_overlay_toggle(self) -> None:
+        """Center the chevron button just below the jog bar. When the jog
+        bar is hidden, pin the chevron near the bottom of the screen
+        instead so the user still has a way to bring the controls back."""
+        w = self.overlay_toggle.width()
+        h = self.overlay_toggle.height()
+        x = (self.width() - w) // 2
+        if self.jog_bar.isVisible():
+            y = self.jog_bar.y() + self.jog_bar.height() + 6
+        else:
+            y = self.height() - h - 14
+        # Guard against falling off-screen in weird window sizes
+        y = max(0, min(y, self.height() - h - 2))
+        self.overlay_toggle.move(max(0, x), y)
+        self.overlay_toggle.raise_()
+
+    def _build_auto_hide_timer(self) -> None:
+        """Single-shot timer that fires 5 seconds after playback begins
+        (or after the user reveals the controls) to auto-collapse the
+        overlays, when the 'auto-hide controls' option is enabled."""
+        self.auto_hide_timer = QTimer(self)
+        self.auto_hide_timer.setSingleShot(True)
+        self.auto_hide_timer.setInterval(5000)
+        self.auto_hide_timer.timeout.connect(self._auto_hide_fire)
+
+    def _toggle_overlays(self) -> None:
+        if self._overlays_hidden:
+            self._reveal_overlays()
+            # Give the user a fresh 5-second window before auto-hide
+            # takes them away again.
+            if self.auto_hide_overlays and self.is_playing:
+                self.auto_hide_timer.start()
+        else:
+            self._hide_overlays()
+
+    def _hide_overlays(self) -> None:
+        """Hide the timeline, pause, close, and Set Thumbnail buttons.
+        The chevron toggle stays visible so the user can bring them back."""
+        if not self.is_playing:
+            return
+        self._overlays_hidden = True
+        self.jog_bar.hide()
+        self.close_button.hide()
+        self.set_thumb_button.hide()
+        self.overlay_toggle.setText("\u25B4")       # ▴
+        self.overlay_toggle.setToolTip("Show on-screen controls")
+        # Chevron is now on its own at the bottom — reposition accordingly.
+        self._position_overlay_toggle()
+        self.auto_hide_timer.stop()
+
+    def _reveal_overlays(self) -> None:
+        """Restore whatever overlays were visible before _hide_overlays().
+        Respects the "Show Set Thumbnail button" preference."""
+        self._overlays_hidden = False
+        self._position_close_button()
+        self.close_button.show()
+        self.close_button.raise_()
+        if self.show_set_thumb_button:
+            self._position_set_thumb_button()
+            self.set_thumb_button.show()
+            self.set_thumb_button.raise_()
+        self._position_jog_bar()
+        self.jog_bar.show()
+        self.jog_bar.raise_()
+        self.overlay_toggle.setText("\u25BE")       # ▾
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self._position_overlay_toggle()
+
+    def _auto_hide_fire(self) -> None:
+        """5-second timer elapsed — hide overlays unless the user is
+        currently scrubbing the timeline (in which case retry later)."""
+        if not self.is_playing or self._overlays_hidden:
+            return
+        if self.timeline.isSliderDown():
+            # Don't yank the scrubber out from under the user's cursor.
+            self.auto_hide_timer.start()
+            return
+        self._hide_overlays()
 
     @staticmethod
     def _format_time(ms: int) -> str:
@@ -955,6 +1094,7 @@ class VideoGridApp(QMainWindow):
             use_sidecar_default=self.use_sidecar_thumbnails,
             thumbnail_fit_default=self.thumbnail_fit,
             show_set_thumb_default=self.show_set_thumb_button,
+            auto_hide_default=self.auto_hide_overlays,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -964,6 +1104,7 @@ class VideoGridApp(QMainWindow):
             self.use_sidecar_thumbnails = dlg.use_sidecar
             self.thumbnail_fit = dlg.thumbnail_fit
             self.show_set_thumb_button = dlg.show_set_thumb_button
+            self.auto_hide_overlays = dlg.auto_hide_overlays
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -1270,6 +1411,19 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.raise_()
         self.position_timer.start()
 
+        # Controls are visible at the start of each playback; reset the
+        # chevron to its "press to hide" state and show it under the bar.
+        self._overlays_hidden = False
+        self.overlay_toggle.setText("\u25BE")     # ▾
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self._position_overlay_toggle()
+        self.overlay_toggle.show()
+        self.overlay_toggle.raise_()
+
+        # If the user asked for auto-hide, start the 5-second countdown.
+        if self.auto_hide_overlays:
+            self.auto_hide_timer.start()
+
     def _capture_current_frame_as_thumbnail(self) -> None:
         """Snapshot whatever VLC is currently showing and use it as the
         grid thumbnail for the video being played. The PNG is cached in
@@ -1390,9 +1544,12 @@ class VideoGridApp(QMainWindow):
             return
         self.is_playing = False
         self.position_timer.stop()
+        self.auto_hide_timer.stop()
         self.close_button.hide()
         self.set_thumb_button.hide()
         self.jog_bar.hide()
+        self.overlay_toggle.hide()
+        self._overlays_hidden = False
         try:
             self.player.stop()
         except Exception:
@@ -1429,6 +1586,9 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "jog_bar", None) is not None \
                 and self.jog_bar.isVisible():
             self._position_jog_bar()
+        if getattr(self, "overlay_toggle", None) is not None \
+                and self.overlay_toggle.isVisible():
+            self._position_overlay_toggle()
 
     # ------------------------------------------------------------------ misc --
     def _show_about(self) -> None:
