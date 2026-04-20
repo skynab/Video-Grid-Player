@@ -39,9 +39,10 @@ from pathlib import Path
 # ---- dependency checks ----------------------------------------------------
 _missing: list[str] = []
 try:
-    from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, pyqtSignal
+    from PyQt6.QtCore import Qt, QEvent, QRectF, QTimer, QThread, pyqtSignal
     from PyQt6.QtGui import (
-        QAction, QColor, QImage, QKeySequence, QPainter, QPalette, QPixmap,
+        QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath,
+        QPalette, QPixmap, QRegion,
     )
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QDialog, QFileDialog, QFrame,
@@ -281,6 +282,25 @@ class SeekSlider(QSlider):
         super().mouseMoveEvent(event)
         if event.buttons() & Qt.MouseButton.LeftButton:
             self.seek_to.emit(self.value())
+
+
+def apply_rounded_mask(widget, radius: int) -> None:
+    """Clip `widget` to a rounded-rectangle region so the rectangular
+    area outside the rounded corners is not drawn at all.
+
+    We need this because on macOS a widget with WA_NativeWindow gets its
+    own NSView whose backing layer is opaque; Qt's `WA_TranslucentBackground`
+    isn't enough to make the corners transparent in every case. `setMask()`
+    clips at the native-window level, bypassing the alpha-blending path
+    entirely, so the black square behind the rounded shape disappears.
+    """
+    if widget.width() <= 0 or widget.height() <= 0:
+        return
+    radius = max(0, min(radius, min(widget.width(), widget.height()) // 2))
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, widget.width(), widget.height()),
+                        radius, radius)
+    widget.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
 class ThumbnailLabel(QLabel):
@@ -733,6 +753,9 @@ class VideoGridApp(QMainWindow):
             "}"
         )
         self.close_button.clicked.connect(self._stop_playback)
+        # Clip to a 48×48 circle so macOS's opaque native backing doesn't
+        # show as a black square around the X.
+        apply_rounded_mask(self.close_button, 24)
         self.close_button.hide()
 
     def _position_close_button(self) -> None:
@@ -758,6 +781,12 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.set_thumb_button.setAttribute(
             Qt.WidgetAttribute.WA_NativeWindow, True)
+        # See the close button for why this is needed — keeps the native
+        # surface transparent so only the pill shape is painted, not the
+        # surrounding rectangle.
+        self.set_thumb_button.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.set_thumb_button.setAutoFillBackground(False)
         self.set_thumb_button.setStyleSheet(
             "#setThumbOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -791,6 +820,10 @@ class VideoGridApp(QMainWindow):
              - self.set_thumb_button.width() - gap)
         y = margin + (self.close_button.height() - 40) // 2
         self.set_thumb_button.move(max(0, x), max(0, y))
+        # Re-apply the pill mask every time the width changes (the button
+        # is resized by adjustSize() when the text changes between ▣ Set
+        # Thumbnail and ✓ Thumbnail Set).
+        apply_rounded_mask(self.set_thumb_button, 20)
         self.set_thumb_button.raise_()
 
     # ------------------------------------------------ jog / transport bar --
@@ -804,6 +837,11 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.jog_bar.setAttribute(
             Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        # Translucent native surface so the rounded pill shape doesn't get
+        # surrounded by an opaque black rectangle.
+        self.jog_bar.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.jog_bar.setAutoFillBackground(False)
         self.jog_bar.setStyleSheet(
             "#jogBar { background-color: rgba(0, 0, 0, 180); "
             "          border-radius: 10px; }"
@@ -911,6 +949,9 @@ class VideoGridApp(QMainWindow):
         x = (self.width() - bar_width) // 2
         y = self.height() - bar_height - margin_y
         self.jog_bar.move(max(0, x), max(0, y))
+        # Re-mask on every resize so the rounded pill shape stays clipped
+        # instead of leaking a black rectangle over the video on macOS.
+        apply_rounded_mask(self.jog_bar, 10)
         self.jog_bar.raise_()
 
     # ------------------------------------------ chevron hide/show toggle --
@@ -927,6 +968,9 @@ class VideoGridApp(QMainWindow):
         self.overlay_toggle.setToolTip("Hide on-screen controls")
         self.overlay_toggle.setAttribute(
             Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.overlay_toggle.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.overlay_toggle.setAutoFillBackground(False)
         self.overlay_toggle.setStyleSheet(
             "#overlayToggle {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -946,6 +990,7 @@ class VideoGridApp(QMainWindow):
             "}"
         )
         self.overlay_toggle.clicked.connect(self._toggle_overlays)
+        apply_rounded_mask(self.overlay_toggle, 14)
         self.overlay_toggle.hide()
 
     def _position_overlay_toggle(self) -> None:
