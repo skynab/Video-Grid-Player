@@ -508,7 +508,7 @@ class OpenFolderDialog(QDialog):
                  shuffle_default: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(640, 650)
+        self.setFixedSize(560, 470)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -522,13 +522,16 @@ class OpenFolderDialog(QDialog):
         self.shuffle_play: bool = shuffle_default
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 20)
+        root.setContentsMargins(22, 18, 22, 16)
+        root.setSpacing(0)
 
         title = QLabel("Video Grid Player")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
             "color: white; font-size: 18px; font-weight: bold;")
         root.addWidget(title)
+
+        root.addSpacing(7)
 
         desc = QLabel(
             "Select a folder containing your video files.\n"
@@ -537,7 +540,7 @@ class OpenFolderDialog(QDialog):
         desc.setStyleSheet("color: #bbbbbb;")
         root.addWidget(desc)
 
-        root.addSpacing(18)
+        root.addSpacing(12)
 
         # --- grid size controls ------------------------------------------
         spin_style = (
@@ -585,7 +588,7 @@ class OpenFolderDialog(QDialog):
         grid_row.addStretch(1)
         root.addLayout(grid_row)
 
-        root.addSpacing(14)
+        root.addSpacing(10)
 
         # --- options ------------------------------------------------------
         check_style = (
@@ -608,7 +611,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.titles_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.full_width_checkbox = QCheckBox(
             "Full-width layout (no gaps between videos)")
@@ -618,7 +621,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.full_width_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.sidecar_checkbox = QCheckBox(
             "Use matching image files as thumbnails "
@@ -629,7 +632,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.sidecar_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.clip_thumb_checkbox = QCheckBox(
             "Preserve thumbnail aspect ratio "
@@ -641,7 +644,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.clip_thumb_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.set_thumb_button_checkbox = QCheckBox(
             "Show \u201cSet Thumbnail\u201d button while a video is playing")
@@ -652,7 +655,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.set_thumb_button_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.auto_hide_checkbox = QCheckBox(
             "Auto-hide on-screen controls after 5 seconds of playback")
@@ -662,7 +665,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.auto_hide_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.shuffle_checkbox = QCheckBox(
             "Shuffle \u2014 play a random video when the current one ends")
@@ -672,7 +675,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.shuffle_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addStretch(1)
+        root.addSpacing(14)
 
         # --- buttons ------------------------------------------------------
         row = QHBoxLayout()
@@ -880,16 +883,96 @@ class VideoGridApp(QMainWindow):
         platform. The widget keeps the main window as its Qt parent, so
         Qt automatically hides/shows it with the parent and it doesn't
         get a taskbar entry (because of Qt.Tool).
+
+        CustomizeWindowHint tells Qt to honor ONLY the hints we've set
+        here — without it, Windows still draws a thin gray client-edge
+        border around the window even though FramelessWindowHint is on.
         """
         widget.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.CustomizeWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.NoDropShadowWindowHint
         )
         widget.setAttribute(
             Qt.WidgetAttribute.WA_TranslucentBackground, True)
         widget.setAutoFillBackground(False)
+
+    def _strip_native_window_border(self, widget) -> None:
+        """On Windows, explicitly remove the extended window styles that
+        draw a thin gray edge around top-level windows. Must be called
+        after the widget's native HWND exists (i.e. after show()).
+
+        No-op on macOS / Linux.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            hwnd = int(widget.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_CLIENTEDGE = 0x00000200
+            WS_EX_STATICEDGE = 0x00020000
+            WS_EX_DLGMODALFRAME = 0x00000001
+            WS_EX_WINDOWEDGE = 0x00000100
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            GetWindowLongW = user32.GetWindowLongW
+            GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            GetWindowLongW.restype = ctypes.c_long
+            SetWindowLongW = user32.SetWindowLongW
+            SetWindowLongW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            SetWindowLongW.restype = ctypes.c_long
+            ex = GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new_ex = ex & ~(
+                WS_EX_CLIENTEDGE
+                | WS_EX_STATICEDGE
+                | WS_EX_DLGMODALFRAME
+                | WS_EX_WINDOWEDGE
+            )
+            if new_ex != ex:
+                SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
+                user32.SetWindowPos(
+                    hwnd, 0, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                    | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                )
+        except Exception as exc:
+            print(f"[overlay] could not strip window border: {exc}")
+
+        # Windows 11 paints a thin 1px "accent color" border around every
+        # top-level window by default, even frameless ones. The only way
+        # to remove it is to tell DWM to use DWMWA_COLOR_NONE for the
+        # border color, and to disable Windows 11's automatic rounded
+        # corners (we draw our own via setMask). These attributes don't
+        # exist pre-Windows-11 — the calls just return E_INVALIDARG and
+        # are harmless.
+        try:
+            import ctypes
+            dwmapi = ctypes.windll.dwmapi
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWA_BORDER_COLOR = 34
+            DWMWCP_DONOTROUND = 1
+            DWMWA_COLOR_NONE = 0xFFFFFFFE
+            corner_pref = ctypes.c_int(DWMWCP_DONOTROUND)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+            border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(border_color), ctypes.sizeof(border_color))
+        except Exception:
+            # Older Windows (10 and below) doesn't expose these
+            # attributes; silently fall through.
+            pass
 
     def _place_overlay(self, widget, x_local: int, y_local: int) -> None:
         """Move a promoted top-level overlay to `(x_local, y_local)` given
@@ -916,14 +999,13 @@ class VideoGridApp(QMainWindow):
             "#closeOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
             "  color: white;"
-            "  border: 2px solid rgba(255, 255, 255, 90);"
+            "  border: none;"
             "  border-radius: 24px;"
             "  font-size: 22px;"
             "  font-weight: bold;"
             "}"
             "#closeOverlay:hover {"
             "  background-color: rgba(210, 50, 50, 220);"
-            "  border: 2px solid rgba(255, 255, 255, 180);"
             "}"
             "#closeOverlay:pressed {"
             "  background-color: rgba(170, 30, 30, 230);"
@@ -961,7 +1043,7 @@ class VideoGridApp(QMainWindow):
             "#setThumbOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
             "  color: white;"
-            "  border: 2px solid rgba(255, 255, 255, 90);"
+            "  border: none;"
             "  border-radius: 20px;"
             "  font-size: 13px;"
             "  font-weight: bold;"
@@ -969,7 +1051,6 @@ class VideoGridApp(QMainWindow):
             "}"
             "#setThumbOverlay:hover {"
             "  background-color: rgba(43, 95, 161, 220);"
-            "  border: 2px solid rgba(255, 255, 255, 180);"
             "}"
             "#setThumbOverlay:pressed {"
             "  background-color: rgba(36, 82, 139, 230);"
@@ -1032,14 +1113,13 @@ class VideoGridApp(QMainWindow):
             "#pauseBtn {"
             "  background-color: rgba(255, 255, 255, 30);"
             "  color: white;"
-            "  border: 1px solid rgba(255, 255, 255, 100);"
+            "  border: none;"
             "  border-radius: 18px;"
             "  font-size: 15px;"
             "  padding: 0;"
             "}"
             "#pauseBtn:hover {"
             "  background-color: rgba(43, 95, 161, 220);"
-            "  border: 1px solid rgba(255, 255, 255, 180);"
             "}"
             "#pauseBtn:pressed {"
             "  background-color: rgba(36, 82, 139, 230);"
@@ -1137,7 +1217,7 @@ class VideoGridApp(QMainWindow):
             "#overlayToggle {"
             "  background-color: rgba(0, 0, 0, 170);"
             "  color: white;"
-            "  border: 1px solid rgba(255, 255, 255, 90);"
+            "  border: none;"
             "  border-radius: 14px;"
             "  font-size: 16px;"
             "  font-weight: bold;"
@@ -1145,7 +1225,6 @@ class VideoGridApp(QMainWindow):
             "}"
             "#overlayToggle:hover {"
             "  background-color: rgba(43, 95, 161, 220);"
-            "  border: 1px solid rgba(255, 255, 255, 180);"
             "}"
             "#overlayToggle:pressed {"
             "  background-color: rgba(36, 82, 139, 230);"
@@ -1654,7 +1733,13 @@ class VideoGridApp(QMainWindow):
         """Bring every overlay widget above the video surface in native
         window z-order. Used on every play-start and also from the VLC
         'Playing' event, because on Windows the VLC surface can take the
-        top of the z-order mid-initialization and hide our controls."""
+        top of the z-order mid-initialization and hide our controls.
+
+        Also strips the native Windows client-edge style off each overlay
+        (a no-op on macOS/Linux), which removes the thin gray border
+        that Windows would otherwise draw around a top-level Tool
+        window. Idempotent — fine to call repeatedly.
+        """
         if not self.is_playing:
             return
         for widget_attr, visibility_guard in (
@@ -1673,6 +1758,7 @@ class VideoGridApp(QMainWindow):
                 w.raise_()
             except Exception:
                 pass
+            self._strip_native_window_border(w)
 
     def _capture_current_frame_as_thumbnail(self) -> None:
         """Snapshot whatever VLC is currently showing and use it as the
