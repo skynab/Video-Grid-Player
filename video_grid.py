@@ -37,6 +37,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Silence OpenCV's FFmpeg warning spam (e.g. "moov atom not found" that
+# appears on some Windows setups when reading MP4s with non-ASCII paths).
+# Must be set BEFORE cv2 is imported below to take effect.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
 # ---- dependency checks ----------------------------------------------------
 _missing: list[str] = []
 try:
@@ -89,8 +95,21 @@ VIDEO_EXTS = (
 # option is enabled (e.g. `video.jpg` next to `video.mp4`).
 SIDECAR_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
-THUMB_W = 320
-THUMB_H = 180
+# Maximum pixel footprint for decoded thumbnails. Frames are scaled to
+# fit inside this box while preserving aspect ratio, so thumbnails end up
+# at roughly 720p-ish quality — which means they still look crisp in
+# larger grid cells (e.g. on a 4K screen with a 2x2 layout) without
+# bloating memory. Doubled from the original 320x180 for noticeably
+# sharper previews.
+THUMB_W = 640
+THUMB_H = 360
+
+# Minimum on-screen size of each grid cell's thumbnail widget. This is
+# deliberately smaller than the decoded THUMB_W x THUMB_H so that dense
+# layouts (e.g. 6x6) still fit on a normal monitor — the cell can scale
+# up to the full decoded resolution when there's room.
+THUMB_MIN_W = 320
+THUMB_MIN_H = 180
 
 # All title boxes in the grid are pinned to this height so they line up
 # visually, regardless of whether a filename happens to be long or short.
@@ -141,6 +160,87 @@ def _find_sidecar_image(video_path: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Thumbnail extraction (runs on a worker thread)
 # ---------------------------------------------------------------------------
+def _cv_safe_path(path: str) -> str:
+    """Return a path OpenCV's Windows file-open can handle without mangling
+    non-ASCII characters.
+
+    OpenCV on Windows opens files through its FFmpeg backend using the
+    narrow (ANSI) Windows file APIs. Any non-ASCII character in the path
+    is silently mistranscoded, so the underlying ``fopen`` ends up
+    reading an entirely different file (or garbage), and FFmpeg reports
+    the infamous ``moov atom not found`` even though the MP4 itself is
+    perfectly fine. The reliable workaround is to translate the path to
+    its Windows 8.3 short form, which is pure ASCII by construction.
+
+    On non-Windows platforms the path is returned unchanged.
+    """
+    if sys.platform != "win32":
+        return path
+    abspath = os.path.abspath(path)
+    # Fast path: if it's already plain ASCII, no translation needed.
+    try:
+        abspath.encode("ascii")
+        return abspath
+    except UnicodeEncodeError:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+        ]
+        GetShortPathNameW.restype = wintypes.DWORD
+        needed = GetShortPathNameW(abspath, None, 0)
+        if needed > 0:
+            buf = ctypes.create_unicode_buffer(needed)
+            if GetShortPathNameW(abspath, buf, needed):
+                return buf.value
+    except Exception as exc:
+        print(f"[thumbnail] short-path lookup failed for {abspath!r}: {exc}")
+    return abspath
+
+
+def _open_video_capture(path: str) -> "cv2.VideoCapture":
+    """Open a video with OpenCV, trying several backends until one
+    actually succeeds.
+
+    Different OpenCV builds ship with different backends available, and
+    on Windows in particular the default backend selection is
+    occasionally broken for MP4s whose paths contain non-ASCII
+    characters. We try FFmpeg first (most capable), then the platform
+    default, then Media Foundation on Windows as a last resort.
+    """
+    safe = _cv_safe_path(path)
+    backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
+    if sys.platform == "win32" and hasattr(cv2, "CAP_MSMF"):
+        backends.append(cv2.CAP_MSMF)
+    last: "cv2.VideoCapture | None" = None
+    for backend in backends:
+        try:
+            cap = cv2.VideoCapture(safe, backend)
+        except Exception as exc:
+            print(f"[thumbnail] backend {backend} raised for {path!r}: {exc}")
+            continue
+        if cap.isOpened():
+            return cap
+        cap.release()
+        last = None
+    # Final fall-through: try the original (non-short) path with the
+    # default backend, in case the short-path translation itself was the
+    # problem (e.g. short names disabled on the volume).
+    if safe != path:
+        try:
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                return cap
+            cap.release()
+        except Exception as exc:
+            print(f"[thumbnail] default-backend retry raised for {path!r}: {exc}")
+    # Return a closed capture so callers can check isOpened() uniformly.
+    return last if last is not None else cv2.VideoCapture()
+
+
 def _fit_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
     """Scale an RGB numpy image to fit within THUMB_W x THUMB_H while
     preserving aspect ratio, and return a QImage of exactly the scaled
@@ -161,18 +261,26 @@ def _fit_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
 
 def extract_thumbnail(path: str) -> "QImage | None":
     """Grab a representative frame from a video and return it as a
-    letterboxed QImage of size (THUMB_W x THUMB_H)."""
-    cap = cv2.VideoCapture(path)
+    QImage scaled (with aspect preserved) to fit within THUMB_W x THUMB_H.
+
+    Returns None if no backend can open the file or no frame can be
+    decoded — the caller treats that as "no thumbnail available" and
+    leaves a placeholder in the grid cell.
+    """
+    cap = _open_video_capture(path)
     if not cap.isOpened():
+        print(f"[thumbnail] could not open video: {path!r}")
         return None
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        # Skip a bit into the file to avoid black intros / studio logos
+        # Skip a bit into the file to avoid black intros / studio logos.
         if total > 1:
             cap.set(cv2.CAP_PROP_POS_FRAMES,
                     max(1, min(total // 10, total - 1)))
         ok, frame = cap.read()
-        if not ok:
+        if not ok or frame is None:
+            # Some streams return False when seeking past the start; try
+            # again from frame 0 before giving up.
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = cap.read()
         if not ok or frame is None:
@@ -625,8 +733,23 @@ class VideoGridApp(QMainWindow):
             "QLabel      { color: white; }"
         )
 
-        # VLC
-        self.vlc_instance = vlc.Instance(["--no-video-title-show"])
+        # VLC.
+        # On Windows we pass a few extra options:
+        #   --vout=direct3d11  picks the compositing-friendly D3D11 output,
+        #     which honors HWND z-order and plays nicely with our overlay
+        #     controls. Older outputs (overlay / DirectDraw) can draw over
+        #     sibling HWNDs regardless of z-order, hiding our controls.
+        #   --no-mouse-events / --no-keyboard-events  stop VLC from
+        #     swallowing clicks and keys on its own video window so events
+        #     fall through to our overlay buttons.
+        vlc_args = ["--no-video-title-show"]
+        if sys.platform == "win32":
+            vlc_args += [
+                "--vout=direct3d11",
+                "--no-mouse-events",
+                "--no-keyboard-events",
+            ]
+        self.vlc_instance = vlc.Instance(vlc_args)
         self.player = self.vlc_instance.media_player_new()
         em = self.player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerEndReached,
@@ -687,6 +810,15 @@ class VideoGridApp(QMainWindow):
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self._show_open_dialog)
         file_menu.addAction(open_act)
+        file_menu.addSeparator()
+        # Full Screen toggle. Checkable so the menu reflects the current
+        # state. Uses the platform standard shortcut (F11 on Windows/Linux,
+        # Ctrl+Cmd+F on macOS).
+        self.fullscreen_act = QAction("Full Screen", self)
+        self.fullscreen_act.setCheckable(True)
+        self.fullscreen_act.setShortcut(QKeySequence.StandardKey.FullScreen)
+        self.fullscreen_act.triggered.connect(self._toggle_fullscreen)
+        file_menu.addAction(self.fullscreen_act)
         file_menu.addSeparator()
         exit_act = QAction("Exit", self)
         exit_act.setShortcut(QKeySequence.StandardKey.Quit)
@@ -1295,7 +1427,7 @@ class VideoGridApp(QMainWindow):
         if self.full_width:
             thumb.setMinimumSize(1, 1)
         else:
-            thumb.setMinimumSize(THUMB_W, THUMB_H)
+            thumb.setMinimumSize(THUMB_MIN_W, THUMB_MIN_H)
         thumb.setStyleSheet(
             "background: black; color: #777777; "
             "font-size: 11px; border: none;")
@@ -1439,6 +1571,15 @@ class VideoGridApp(QMainWindow):
             # which is exactly what libvlc's set_nsobject expects.
             self.player.set_nsobject(handle)
 
+        # Stop VLC from grabbing mouse/keyboard input on the video surface.
+        # Without this, on Windows the video window eats clicks that were
+        # aimed at our overlay controls, so buttons appear "stuck behind".
+        try:
+            self.player.video_set_mouse_input(False)
+            self.player.video_set_key_input(False)
+        except Exception:
+            pass
+
         media = self.vlc_instance.media_new(path)
         self.player.set_media(media)
         self.player.play()
@@ -1447,7 +1588,6 @@ class VideoGridApp(QMainWindow):
         # of the video.
         self._position_close_button()
         self.close_button.show()
-        self.close_button.raise_()
 
         # Reset the "Set Thumbnail" button label in case it was showing
         # the "✓ Thumbnail Set" confirmation from a previous play, then
@@ -1457,7 +1597,6 @@ class VideoGridApp(QMainWindow):
         if self.show_set_thumb_button:
             self._position_set_thumb_button()
             self.set_thumb_button.show()
-            self.set_thumb_button.raise_()
         else:
             self.set_thumb_button.hide()
 
@@ -1470,7 +1609,6 @@ class VideoGridApp(QMainWindow):
         self._set_pause_button_state(paused=False)
         self._position_jog_bar()
         self.jog_bar.show()
-        self.jog_bar.raise_()
         self.position_timer.start()
 
         # Controls are visible at the start of each playback; reset the
@@ -1480,11 +1618,42 @@ class VideoGridApp(QMainWindow):
         self.overlay_toggle.setToolTip("Hide on-screen controls")
         self._position_overlay_toggle()
         self.overlay_toggle.show()
-        self.overlay_toggle.raise_()
+
+        # Raise all overlays above the video surface. On Windows VLC may
+        # briefly take the top of the child z-order when its rendering
+        # surface is created, so we also schedule a few deferred re-raises
+        # covering the first ~1s of playback as a safety net.
+        self._raise_all_overlays()
+        for delay in (50, 150, 350, 700, 1200):
+            QTimer.singleShot(delay, self._raise_all_overlays)
 
         # If the user asked for auto-hide, start the 5-second countdown.
         if self.auto_hide_overlays:
             self.auto_hide_timer.start()
+
+    def _raise_all_overlays(self) -> None:
+        """Bring every overlay widget above the video surface in native
+        window z-order. Used on every play-start and also from the VLC
+        'Playing' event, because on Windows the VLC surface can take the
+        top of the z-order mid-initialization and hide our controls."""
+        if not self.is_playing:
+            return
+        for widget_attr, visibility_guard in (
+            ("close_button", lambda: True),
+            ("set_thumb_button", lambda: self.show_set_thumb_button
+                and not self._overlays_hidden),
+            ("jog_bar", lambda: not self._overlays_hidden),
+            ("overlay_toggle", lambda: True),
+        ):
+            w = getattr(self, widget_attr, None)
+            if w is None or not w.isVisible():
+                continue
+            if not visibility_guard():
+                continue
+            try:
+                w.raise_()
+            except Exception:
+                pass
 
     def _capture_current_frame_as_thumbnail(self) -> None:
         """Snapshot whatever VLC is currently showing and use it as the
@@ -1594,8 +1763,14 @@ class VideoGridApp(QMainWindow):
             0, lambda: self._set_pause_button_state(paused=True))
 
     def _on_vlc_playing(self, _event) -> None:
-        QTimer.singleShot(
-            0, lambda: self._set_pause_button_state(paused=False))
+        # Fires on VLC's thread. Bounce to the GUI thread and, as well as
+        # syncing the pause button, re-raise our overlays — VLC's first
+        # frame on Windows often pushes its rendering surface to the top
+        # of the child z-order and would otherwise hide the controls.
+        def _on_gui_thread() -> None:
+            self._set_pause_button_state(paused=False)
+            self._raise_all_overlays()
+        QTimer.singleShot(0, _on_gui_thread)
 
     def _on_vlc_end(self, _event) -> None:
         # Fires on VLC's thread — defer UI updates to the Qt main loop
@@ -1704,6 +1879,34 @@ class VideoGridApp(QMainWindow):
             self._position_overlay_toggle()
 
     # ------------------------------------------------------------------ misc --
+    def _toggle_fullscreen(self, checked: bool | None = None) -> None:
+        """Toggle the main window between full-screen and normal.
+
+        Note: this toggles the OS-level full-screen state of the *main
+        window* (i.e. the frame / menu bar / title bar are hidden) and
+        is independent of the in-app "play this video fullscreen inside
+        the grid window" behavior.
+        """
+        if self.isFullScreen():
+            # Return to whichever pre-fullscreen state we had. showNormal()
+            # handles both maximized and ordinary windows correctly on all
+            # three platforms.
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        # Keep the menu check in sync with the actual window state.
+        if getattr(self, "fullscreen_act", None) is not None:
+            self.fullscreen_act.setChecked(self.isFullScreen())
+
+    def changeEvent(self, event):
+        # The user can leave fullscreen via the OS (e.g. Esc on some
+        # desktops, window manager shortcut, Mission Control, etc.). Keep
+        # our menu toggle honest by mirroring the real window state.
+        if event.type() == QEvent.Type.WindowStateChange \
+                and getattr(self, "fullscreen_act", None) is not None:
+            self.fullscreen_act.setChecked(self.isFullScreen())
+        super().changeEvent(event)
+
     def _show_about(self) -> None:
         QMessageBox.information(
             self, "About Video Grid Player",
