@@ -46,7 +46,9 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 # ---- dependency checks ----------------------------------------------------
 _missing: list[str] = []
 try:
-    from PyQt6.QtCore import Qt, QEvent, QRectF, QTimer, QThread, pyqtSignal
+    from PyQt6.QtCore import (
+        Qt, QEvent, QPoint, QRectF, QTimer, QThread, pyqtSignal,
+    )
     from PyQt6.QtGui import (
         QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath,
         QPalette, QPixmap, QRegion,
@@ -735,17 +737,20 @@ class VideoGridApp(QMainWindow):
 
         # VLC.
         # On Windows we pass a few extra options:
-        #   --vout=direct3d11  picks the compositing-friendly D3D11 output,
-        #     which honors HWND z-order and plays nicely with our overlay
-        #     controls. Older outputs (overlay / DirectDraw) can draw over
-        #     sibling HWNDs regardless of z-order, hiding our controls.
+        #   --vout=direct3d9  is the well-tested Direct3D9 output. It
+        #     honors HWND z-order (so our overlay controls stay on top)
+        #     AND doesn't call the DWM's SetThumbNailClip API that the
+        #     newer direct3d11 vout uses. That call fails with
+        #     0x800706f4 (RPC_X_NULL_REF_POINTER) on embedded child
+        #     HWNDs like ours, and its error path can wedge VLC's
+        #     cleanup when a video ends, causing the whole app to hang.
         #   --no-mouse-events / --no-keyboard-events  stop VLC from
         #     swallowing clicks and keys on its own video window so events
         #     fall through to our overlay buttons.
         vlc_args = ["--no-video-title-show"]
         if sys.platform == "win32":
             vlc_args += [
-                "--vout=direct3d11",
+                "--vout=direct3d9",
                 "--no-mouse-events",
                 "--no-keyboard-events",
             ]
@@ -861,12 +866,44 @@ class VideoGridApp(QMainWindow):
 
         self.stack.addWidget(self.video_page)
 
+    # --------- overlay window helpers ---------------------------------------
+    def _promote_to_overlay_window(self, widget) -> None:
+        """Make `widget` a top-level frameless Tool window that floats
+        above the main window.
+
+        Rationale: on Windows, even with WA_NativeWindow + raise_(), the
+        VLC video surface (a hardware-accelerated child HWND) can end up
+        drawn above sibling HWNDs in ways that hide our overlay controls.
+        Promoting the controls to separate top-level windows gives each
+        one its own HWND at a different level of the window hierarchy,
+        where it is trivially above the main window's content on every
+        platform. The widget keeps the main window as its Qt parent, so
+        Qt automatically hides/shows it with the parent and it doesn't
+        get a taskbar entry (because of Qt.Tool).
+        """
+        widget.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        widget.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        widget.setAutoFillBackground(False)
+
+    def _place_overlay(self, widget, x_local: int, y_local: int) -> None:
+        """Move a promoted top-level overlay to `(x_local, y_local)` given
+        in this window's local coordinate space. Because overlays are
+        top-level windows, `move()` takes global screen coordinates — so
+        we translate before moving."""
+        gp = self.mapToGlobal(QPoint(max(0, x_local), max(0, y_local)))
+        widget.move(gp)
+
     def _build_close_overlay(self) -> None:
         """Floating X button shown over the video while playing.
 
-        Parented to the main window (not the stack page) and given its
-        own native surface via WA_NativeWindow so it composites cleanly
-        on top of VLC's video output on every platform.
+        Implemented as a top-level frameless Tool window so it reliably
+        floats above VLC's native video surface on every platform.
         """
         self.close_button = QPushButton("✕", self)
         self.close_button.setObjectName("closeOverlay")
@@ -874,14 +911,7 @@ class VideoGridApp(QMainWindow):
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_button.setToolTip("Close video and return to grid (Esc)")
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.close_button.setAttribute(
-            Qt.WidgetAttribute.WA_NativeWindow, True)
-        # Make the native surface translucent so only the rounded button
-        # shape is painted — otherwise the native window is opaque black
-        # and you see a rectangle around the circular button.
-        self.close_button.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.close_button.setAutoFillBackground(False)
+        self._promote_to_overlay_window(self.close_button)
         self.close_button.setStyleSheet(
             "#closeOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -910,7 +940,7 @@ class VideoGridApp(QMainWindow):
         margin = 20
         x = self.width() - self.close_button.width() - margin
         y = margin
-        self.close_button.move(max(0, x), max(0, y))
+        self._place_overlay(self.close_button, x, y)
         self.close_button.raise_()
 
     # ---------------------------------------------- "Set Thumbnail" overlay --
@@ -926,14 +956,7 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.setToolTip(
             "Use the current frame as this video's grid thumbnail")
         self.set_thumb_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.set_thumb_button.setAttribute(
-            Qt.WidgetAttribute.WA_NativeWindow, True)
-        # See the close button for why this is needed — keeps the native
-        # surface transparent so only the pill shape is painted, not the
-        # surrounding rectangle.
-        self.set_thumb_button.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.set_thumb_button.setAutoFillBackground(False)
+        self._promote_to_overlay_window(self.set_thumb_button)
         self.set_thumb_button.setStyleSheet(
             "#setThumbOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -963,10 +986,13 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.adjustSize()
         # adjustSize() respects text width but we forced a fixed height earlier.
         self.set_thumb_button.setFixedHeight(40)
-        x = (self.close_button.x()
-             - self.set_thumb_button.width() - gap)
+        # Compute the close button's position in OUR local coord space
+        # (close_button is a top-level window, so its .x()/.y() are global).
+        close_local = self.mapFromGlobal(
+            QPoint(self.close_button.x(), self.close_button.y()))
+        x = close_local.x() - self.set_thumb_button.width() - gap
         y = margin + (self.close_button.height() - 40) // 2
-        self.set_thumb_button.move(max(0, x), max(0, y))
+        self._place_overlay(self.set_thumb_button, x, y)
         # Re-apply the pill mask every time the width changes (the button
         # is resized by adjustSize() when the text changes between ▣ Set
         # Thumbnail and ✓ Thumbnail Set).
@@ -981,14 +1007,7 @@ class VideoGridApp(QMainWindow):
         native surface so it draws cleanly on top of native video."""
         self.jog_bar = QWidget(self)
         self.jog_bar.setObjectName("jogBar")
-        self.jog_bar.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.jog_bar.setAttribute(
-            Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
-        # Translucent native surface so the rounded pill shape doesn't get
-        # surrounded by an opaque black rectangle.
-        self.jog_bar.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.jog_bar.setAutoFillBackground(False)
+        self._promote_to_overlay_window(self.jog_bar)
         self.jog_bar.setStyleSheet(
             "#jogBar { background-color: rgba(0, 0, 0, 180); "
             "          border-radius: 10px; }"
@@ -1095,7 +1114,7 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.setFixedWidth(bar_width)
         x = (self.width() - bar_width) // 2
         y = self.height() - bar_height - margin_y
-        self.jog_bar.move(max(0, x), max(0, y))
+        self._place_overlay(self.jog_bar, x, y)
         # Re-mask on every resize so the rounded pill shape stays clipped
         # instead of leaking a black rectangle over the video on macOS.
         apply_rounded_mask(self.jog_bar, 10)
@@ -1113,11 +1132,7 @@ class VideoGridApp(QMainWindow):
         self.overlay_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.overlay_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.overlay_toggle.setToolTip("Hide on-screen controls")
-        self.overlay_toggle.setAttribute(
-            Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.overlay_toggle.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.overlay_toggle.setAutoFillBackground(False)
+        self._promote_to_overlay_window(self.overlay_toggle)
         self.overlay_toggle.setStyleSheet(
             "#overlayToggle {"
             "  background-color: rgba(0, 0, 0, 170);"
@@ -1148,12 +1163,16 @@ class VideoGridApp(QMainWindow):
         h = self.overlay_toggle.height()
         x = (self.width() - w) // 2
         if self.jog_bar.isVisible():
-            y = self.jog_bar.y() + self.jog_bar.height() + 6
+            # jog_bar is a top-level window now, so its .y() is a global
+            # coord — translate into our local space first.
+            jog_local = self.mapFromGlobal(
+                QPoint(self.jog_bar.x(), self.jog_bar.y()))
+            y = jog_local.y() + self.jog_bar.height() + 6
         else:
             y = self.height() - h - 14
         # Guard against falling off-screen in weird window sizes
         y = max(0, min(y, self.height() - h - 2))
-        self.overlay_toggle.move(max(0, x), y)
+        self._place_overlay(self.overlay_toggle, x, y)
         self.overlay_toggle.raise_()
 
     def _build_auto_hide_timer(self) -> None:
@@ -1808,10 +1827,7 @@ class VideoGridApp(QMainWindow):
         # keep is_playing=True and stay on the video page / fullscreen.
         self.position_timer.stop()
         self.auto_hide_timer.stop()
-        try:
-            self.player.stop()
-        except Exception:
-            pass
+        self._stop_vlc_player()
 
         self.current_video_path = next_path
         try:
@@ -1827,6 +1843,30 @@ class VideoGridApp(QMainWindow):
         if was_hidden:
             QTimer.singleShot(140, self._hide_overlays)
 
+    def _stop_vlc_player(self) -> None:
+        """Stop the VLC player safely.
+
+        Before calling stop() we detach the native render surface by
+        passing a null handle. This gives VLC a clean signal to release
+        its renderer and avoids a class of Windows hangs where the vout
+        module blocks trying to clip a DWM taskbar thumbnail against a
+        disappearing HWND (the old ``SetThumbNailClip 0x800706f4``
+        symptom with the d3d11 output). Harmless on macOS/Linux.
+        """
+        try:
+            if sys.platform == "win32":
+                self.player.set_hwnd(0)
+            elif sys.platform.startswith("linux"):
+                self.player.set_xwindow(0)
+            elif sys.platform == "darwin":
+                self.player.set_nsobject(0)
+        except Exception:
+            pass
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+
     def _stop_playback(self) -> None:
         if not self.is_playing:
             return
@@ -1838,10 +1878,7 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.hide()
         self.overlay_toggle.hide()
         self._overlays_hidden = False
-        try:
-            self.player.stop()
-        except Exception:
-            pass
+        self._stop_vlc_player()
         self.current_video_path = None
         self.current_video_idx = None
         self.showNormal()
@@ -1864,7 +1901,20 @@ class VideoGridApp(QMainWindow):
     # ---------------------------------------------------------------- resize --
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Keep the floating overlays pinned to their corners on every resize
+        self._reposition_visible_overlays()
+
+    def moveEvent(self, event):
+        # Overlays are top-level windows positioned in global coords, so
+        # they need to be re-placed whenever the main window moves (e.g.
+        # the user drags the title bar or the window goes full-screen).
+        super().moveEvent(event)
+        self._reposition_visible_overlays()
+
+    def _reposition_visible_overlays(self) -> None:
+        """Re-run each overlay's positioning function if that overlay is
+        currently visible. Used by resizeEvent and moveEvent to keep the
+        top-level overlay windows pinned to their place over the main
+        window as it resizes or moves."""
         if getattr(self, "close_button", None) is not None \
                 and self.close_button.isVisible():
             self._position_close_button()
@@ -1901,10 +1951,15 @@ class VideoGridApp(QMainWindow):
     def changeEvent(self, event):
         # The user can leave fullscreen via the OS (e.g. Esc on some
         # desktops, window manager shortcut, Mission Control, etc.). Keep
-        # our menu toggle honest by mirroring the real window state.
-        if event.type() == QEvent.Type.WindowStateChange \
-                and getattr(self, "fullscreen_act", None) is not None:
-            self.fullscreen_act.setChecked(self.isFullScreen())
+        # our menu toggle honest by mirroring the real window state, and
+        # nudge the top-level overlay windows to re-pin themselves over
+        # the (possibly just-resized) main window.
+        if event.type() == QEvent.Type.WindowStateChange:
+            if getattr(self, "fullscreen_act", None) is not None:
+                self.fullscreen_act.setChecked(self.isFullScreen())
+            # Defer the reposition by one event-loop tick so the main
+            # window's geometry has settled into its new state.
+            QTimer.singleShot(0, self._reposition_visible_overlays)
         super().changeEvent(event)
 
     def _show_about(self) -> None:
@@ -1927,8 +1982,11 @@ class VideoGridApp(QMainWindow):
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
+        # Use the safe stop path that detaches the render HWND first,
+        # then release the player / instance. Without the HWND detach,
+        # VLC can hang on app-exit with the d3d11 vout bug.
+        self._stop_vlc_player()
         try:
-            self.player.stop()
             self.player.release()
             self.vlc_instance.release()
         except Exception:
