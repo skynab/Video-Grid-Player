@@ -54,7 +54,7 @@ try:
         QPalette, QPixmap, QRegion,
     )
     from PyQt6.QtWidgets import (
-        QApplication, QCheckBox, QDialog, QFileDialog, QFrame,
+        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
         QPushButton, QSlider, QSpinBox, QStackedWidget, QVBoxLayout,
         QWidget,
@@ -97,19 +97,43 @@ VIDEO_EXTS = (
 # option is enabled (e.g. `video.jpg` next to `video.mp4`).
 SIDECAR_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
-# Maximum pixel footprint for decoded thumbnails. Frames are scaled to
-# fit inside this box while preserving aspect ratio, so thumbnails end up
-# at roughly 720p-ish quality — which means they still look crisp in
-# larger grid cells (e.g. on a 4K screen with a 2x2 layout) without
-# bloating memory. Doubled from the original 320x180 for noticeably
-# sharper previews.
-THUMB_W = 640
-THUMB_H = 360
+# User-selectable thumbnail resolution. Each option names the maximum
+# pixel footprint for decoded thumbnails; frames are scaled to fit inside
+# this box while preserving aspect ratio. Higher resolutions look crisper
+# on larger grid cells and high-DPI / 4K monitors at the cost of more
+# memory and a slower initial decode.
+#
+#   Standard (640x360 / 360p)   - light and fast; fine for 1080p monitors
+#                                 and dense grids (e.g. 6x6).
+#   High     (1280x720 / 720p)  - great on 1080p, decent on 4K. Default.
+#   Ultra    (1920x1080 / 1080p)- best on 4K / high-DPI; heaviest footprint.
+THUMB_RES_STANDARD = "standard"
+THUMB_RES_HIGH = "high"
+THUMB_RES_ULTRA = "ultra"
+
+THUMB_RESOLUTIONS: dict[str, tuple[int, int]] = {
+    THUMB_RES_STANDARD: (640, 360),
+    THUMB_RES_HIGH: (1280, 720),
+    THUMB_RES_ULTRA: (1920, 1080),
+}
+THUMB_RES_LABELS: dict[str, str] = {
+    THUMB_RES_STANDARD: "Standard (360p)",
+    THUMB_RES_HIGH: "High (720p)",
+    THUMB_RES_ULTRA: "Ultra (1080p)",
+}
+DEFAULT_THUMB_RES = THUMB_RES_HIGH
+
+
+def thumb_size_for(resolution: str) -> tuple[int, int]:
+    """Look up the (width, height) budget for a thumbnail resolution key,
+    falling back to the default if the key is unknown."""
+    return THUMB_RESOLUTIONS.get(resolution,
+                                 THUMB_RESOLUTIONS[DEFAULT_THUMB_RES])
+
 
 # Minimum on-screen size of each grid cell's thumbnail widget. This is
-# deliberately smaller than the decoded THUMB_W x THUMB_H so that dense
-# layouts (e.g. 6x6) still fit on a normal monitor — the cell can scale
-# up to the full decoded resolution when there's room.
+# about grid layout, not thumbnail quality — cells can scale up to the
+# full decoded resolution when there's room.
 THUMB_MIN_W = 320
 THUMB_MIN_H = 180
 
@@ -243,13 +267,18 @@ def _open_video_capture(path: str) -> "cv2.VideoCapture":
     return last if last is not None else cv2.VideoCapture()
 
 
-def _fit_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
-    """Scale an RGB numpy image to fit within THUMB_W x THUMB_H while
-    preserving aspect ratio, and return a QImage of exactly the scaled
-    size (no letterbox / padding). The display widget decides later
-    whether to stretch this to fill the cell or to scale-and-clip it."""
+def _fit_rgb_to_qimage(
+    rgb: "np.ndarray",
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage":
+    """Scale an RGB numpy image to fit within the thumbnail resolution's
+    (W, H) budget while preserving aspect ratio, and return a QImage of
+    exactly the scaled size (no letterbox / padding). The display widget
+    decides later whether to stretch this to fill the cell or to
+    scale-and-clip it."""
+    max_w, max_h = thumb_size_for(resolution)
     h, w = rgb.shape[:2]
-    scale = min(THUMB_W / w, THUMB_H / h)
+    scale = min(max_w / w, max_h / h)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -261,9 +290,13 @@ def _fit_rgb_to_qimage(rgb: "np.ndarray") -> "QImage":
     ).copy()
 
 
-def extract_thumbnail(path: str) -> "QImage | None":
+def extract_thumbnail(
+    path: str,
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage | None":
     """Grab a representative frame from a video and return it as a
-    QImage scaled (with aspect preserved) to fit within THUMB_W x THUMB_H.
+    QImage scaled (with aspect preserved) to fit within the budget for
+    `resolution`.
 
     Returns None if no backend can open the file or no frame can be
     decoded — the caller treats that as "no thumbnail available" and
@@ -291,27 +324,33 @@ def extract_thumbnail(path: str) -> "QImage | None":
         cap.release()
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return _fit_rgb_to_qimage(rgb)
+    return _fit_rgb_to_qimage(rgb, resolution)
 
 
-def load_image_as_thumb_qimage(path: str) -> "QImage | None":
+def load_image_as_thumb_qimage(
+    path: str,
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage | None":
     """Load an arbitrary image file (jpg/png/webp/bmp/...) and return a
-    QImage scaled to fit within THUMB_W x THUMB_H while preserving aspect
-    ratio. No padding is added — the display widget is responsible for
-    deciding whether to stretch or clip the image inside its cell."""
+    QImage scaled to fit within the chosen resolution's (W, H) budget
+    while preserving aspect ratio. No padding is added — the display
+    widget is responsible for deciding whether to stretch or clip the
+    image inside its cell."""
     src = QImage(path)
     if src.isNull():
         return None
     src = src.convertToFormat(QImage.Format.Format_RGB888)
+    max_w, max_h = thumb_size_for(resolution)
     return src.scaled(
-        THUMB_W, THUMB_H,
+        max_w, max_h,
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
 
 
 def load_thumbnail_for_video(
-    path: str, use_sidecar: bool
+    path: str, use_sidecar: bool,
+    resolution: str = DEFAULT_THUMB_RES,
 ) -> "QImage | None":
     """Decide which thumbnail to show for a given video:
 
@@ -323,16 +362,16 @@ def load_thumbnail_for_video(
     """
     cached = _cached_thumb_path(path)
     if cached.is_file():
-        img = load_image_as_thumb_qimage(str(cached))
+        img = load_image_as_thumb_qimage(str(cached), resolution)
         if img is not None:
             return img
     if use_sidecar:
         sidecar = _find_sidecar_image(path)
         if sidecar is not None:
-            img = load_image_as_thumb_qimage(sidecar)
+            img = load_image_as_thumb_qimage(sidecar, resolution)
             if img is not None:
                 return img
-    return extract_thumbnail(path)
+    return extract_thumbnail(path, resolution)
 
 
 class ThumbnailWorker(QThread):
@@ -343,10 +382,12 @@ class ThumbnailWorker(QThread):
     video itself."""
     thumbnail_ready = pyqtSignal(int, str, QImage)
 
-    def __init__(self, paths: list[str], use_sidecar: bool = False):
+    def __init__(self, paths: list[str], use_sidecar: bool = False,
+                 resolution: str = DEFAULT_THUMB_RES):
         super().__init__()
         self._paths = paths
         self._use_sidecar = use_sidecar
+        self._resolution = resolution
         self._stop = False
 
     def stop(self) -> None:
@@ -357,7 +398,8 @@ class ThumbnailWorker(QThread):
             if self._stop:
                 return
             try:
-                img = load_thumbnail_for_video(path, self._use_sidecar)
+                img = load_thumbnail_for_video(
+                    path, self._use_sidecar, self._resolution)
             except Exception as exc:
                 print(f"[thumbnail] error for {path!r}: {exc}")
                 img = None
@@ -505,10 +547,11 @@ class OpenFolderDialog(QDialog):
                  thumbnail_fit_default: str = FIT_STRETCH,
                  show_set_thumb_default: bool = True,
                  auto_hide_default: bool = False,
-                 shuffle_default: bool = False):
+                 shuffle_default: bool = False,
+                 thumbnail_resolution_default: str = DEFAULT_THUMB_RES):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(560, 470)
+        self.setFixedSize(560, 535)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -520,6 +563,7 @@ class OpenFolderDialog(QDialog):
         self.show_set_thumb_button: bool = show_set_thumb_default
         self.auto_hide_overlays: bool = auto_hide_default
         self.shuffle_play: bool = shuffle_default
+        self.thumbnail_resolution: str = thumbnail_resolution_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 16)
@@ -587,6 +631,43 @@ class OpenFolderDialog(QDialog):
 
         grid_row.addStretch(1)
         root.addLayout(grid_row)
+
+        root.addSpacing(10)
+
+        # --- thumbnail resolution ----------------------------------------
+        combo_style = (
+            "QComboBox {"
+            "   background: #1a1a1a; color: white; "
+            "   border: 1px solid #444; border-radius: 3px; "
+            "   padding: 4px 8px; font-size: 12px; min-width: 160px;"
+            "}"
+            "QComboBox::drop-down {"
+            "   border: none; width: 18px; "
+            "}"
+            "QComboBox QAbstractItemView {"
+            "   background: #1a1a1a; color: white; "
+            "   selection-background-color: #2b5fa1; "
+            "   border: 1px solid #444;"
+            "}"
+        )
+        res_row = QHBoxLayout()
+        res_row.addStretch(1)
+        res_label = QLabel("Thumbnail quality:")
+        res_label.setStyleSheet(label_style)
+        res_row.addWidget(res_label)
+        self.res_combo = QComboBox()
+        self.res_combo.setStyleSheet(combo_style)
+        self.res_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key in (THUMB_RES_STANDARD, THUMB_RES_HIGH, THUMB_RES_ULTRA):
+            self.res_combo.addItem(THUMB_RES_LABELS[key], key)
+        # Select the current default
+        idx = self.res_combo.findData(thumbnail_resolution_default)
+        if idx < 0:
+            idx = self.res_combo.findData(DEFAULT_THUMB_RES)
+        self.res_combo.setCurrentIndex(max(0, idx))
+        res_row.addWidget(self.res_combo)
+        res_row.addStretch(1)
+        root.addLayout(res_row)
 
         root.addSpacing(10)
 
@@ -721,6 +802,9 @@ class OpenFolderDialog(QDialog):
                 self.set_thumb_button_checkbox.isChecked())
             self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
             self.shuffle_play = self.shuffle_checkbox.isChecked()
+            res_key = self.res_combo.currentData()
+            if res_key in THUMB_RESOLUTIONS:
+                self.thumbnail_resolution = res_key
             self.accept()
 
 
@@ -785,6 +869,12 @@ class VideoGridApp(QMainWindow):
         self.auto_hide_overlays: bool = False     # auto-hide after 5 seconds
         self._overlays_hidden: bool = False       # current hide/show state
         self.shuffle_play: bool = False           # play random next on end
+        self.thumbnail_resolution: str = DEFAULT_THUMB_RES  # decoded thumb size
+        # Remembered window state across a play→stop cycle. Populated in
+        # _play_video_at so we can restore the pre-playback window state
+        # (fullscreen / maximized / normal) when playback ends.
+        self._was_fullscreen_before_play: bool = False
+        self._was_maximized_before_play: bool = False
         self.current_video_path: str | None = None
         self.current_video_idx: int | None = None
 
@@ -1386,6 +1476,7 @@ class VideoGridApp(QMainWindow):
             show_set_thumb_default=self.show_set_thumb_button,
             auto_hide_default=self.auto_hide_overlays,
             shuffle_default=self.shuffle_play,
+            thumbnail_resolution_default=self.thumbnail_resolution,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -1397,6 +1488,7 @@ class VideoGridApp(QMainWindow):
             self.show_set_thumb_button = dlg.show_set_thumb_button
             self.auto_hide_overlays = dlg.auto_hide_overlays
             self.shuffle_play = dlg.shuffle_play
+            self.thumbnail_resolution = dlg.thumbnail_resolution
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -1431,6 +1523,7 @@ class VideoGridApp(QMainWindow):
         self.thumb_worker = ThumbnailWorker(
             list(self.video_files),
             use_sidecar=self.use_sidecar_thumbnails,
+            resolution=self.thumbnail_resolution,
         )
         self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail)
         self.thumb_worker.start()
@@ -1647,12 +1740,20 @@ class VideoGridApp(QMainWindow):
         except ValueError:
             self.current_video_idx = None
 
+        # Remember what the main window's display state was before we
+        # force-fullscreen it for playback, so we can restore it on stop
+        # instead of dropping the user out of fullscreen if that's where
+        # they already were.
+        self._was_fullscreen_before_play = self.isFullScreen()
+        self._was_maximized_before_play = self.isMaximized()
+
         # Switch to the video page so the surface is laid out & visible,
         # then go fullscreen, then give Qt one event-loop tick so the
         # native surface is definitely realized before handing its
         # handle to VLC.
         self.stack.setCurrentWidget(self.video_page)
-        self.showFullScreen()
+        if not self._was_fullscreen_before_play:
+            self.showFullScreen()
 
         QTimer.singleShot(60, lambda: self._begin_vlc_playback(path))
 
@@ -1807,7 +1908,8 @@ class VideoGridApp(QMainWindow):
 
         # Load the snapshot, letterbox it to our standard thumb size,
         # and persist it to the cache as <sha1(path)>.png.
-        thumb_qimg = load_image_as_thumb_qimage(tmp_path)
+        thumb_qimg = load_image_as_thumb_qimage(
+            tmp_path, self.thumbnail_resolution)
         dest = _cached_thumb_path(self.current_video_path)
         try:
             os.replace(tmp_path, dest)
@@ -1967,7 +2069,20 @@ class VideoGridApp(QMainWindow):
         self._stop_vlc_player()
         self.current_video_path = None
         self.current_video_idx = None
-        self.showNormal()
+        # Restore whichever window state we had before playback began.
+        # If the user was already in fullscreen before playing a video,
+        # we stay in fullscreen rather than yanking them out of it.
+        if getattr(self, "_was_fullscreen_before_play", False):
+            # Already fullscreen from _play_video_at (or from earlier);
+            # don't touch the window state.
+            pass
+        elif getattr(self, "_was_maximized_before_play", False):
+            self.showMaximized()
+        else:
+            self.showNormal()
+        # Keep the File menu's Full Screen toggle in sync.
+        if getattr(self, "fullscreen_act", None) is not None:
+            self.fullscreen_act.setChecked(self.isFullScreen())
         self.stack.setCurrentWidget(self.grid_page)
 
     # -------------------------------------------------------------- keyboard --

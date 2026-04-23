@@ -24,6 +24,13 @@ uncluttered. The popup also lets you:
   * Pick how thumbnails fill their grid cells: either stretch to fit
     (distorts aspect ratio) or preserve aspect ratio and clip any
     overflow
+  * Pick the thumbnail quality / resolution:
+      - Standard (360p, 640x360)    - light and fast; best for 1080p
+                                      monitors and dense grids (6x6)
+      - High     (720p, 1280x720)   - crisp on 1080p, decent on 4K
+                                      (default)
+      - Ultra    (1080p, 1920x1080) - best on 4K / high-DPI monitors;
+                                      heaviest memory / decode cost
 
 
 THUMBNAILS
@@ -99,6 +106,8 @@ CONTROLS
   Space             Pause / resume the current video
   Left / Right      Seek 5 seconds back / forward
   Ctrl+O / Cmd+O    Open folder
+  F11 / Ctrl+⌘+F    Toggle application full screen
+                    (also available as File -> Full Screen)
   Ctrl+Q / Cmd+Q    Quit
 
 
@@ -112,3 +121,15 @@ NOTES
 * On macOS, if python-vlc imports but video fails to start, your Python
   architecture (arm64 vs x86_64) likely doesn't match the installed
   VLC. Install the matching VLC build.
+* On Windows, if you see `[mov,mp4,m4a,3gp,3g2,mj2 @ ...] moov atom not
+  found` in the console and thumbnails fail to load, it's usually
+  because OpenCV's FFmpeg backend opens files through the narrow (ANSI)
+  Windows file API, which garbles paths containing non-ASCII
+  characters. The app already works around this by translating each
+  path to its Windows 8.3 short form before opening and by trying
+  multiple OpenCV backends, so the error message (if any) is
+  cosmetic — thumbnails should still appear. If they don't, make sure
+  short (8.3) file names aren't disabled on the drive (they are
+  enabled by default on NTFS) and that you have a working FFmpeg build
+  of opencv-python (reinstall with `pip install --upgrade --force-reinstall
+  opencv-python` if in doubt).
