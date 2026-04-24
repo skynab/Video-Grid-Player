@@ -989,6 +989,61 @@ class VideoGridApp(QMainWindow):
             Qt.WidgetAttribute.WA_TranslucentBackground, True)
         widget.setAutoFillBackground(False)
 
+    def _paint_main_window_border_black(self) -> None:
+        """On Windows 11, every top-level window gets a 1px accent-color
+        border *and* 8px rounded corners painted by DWM. In fullscreen
+        the border shows as a thin transparent/colored seam, and the
+        rounded corners leave small gaps in each corner that don't
+        belong in a fullscreen video player.
+
+        Tell DWM to paint the border black (blends into the dark app
+        background) and to not round corners. Re-applied on every
+        window state change because Windows sometimes resets these
+        attributes during fullscreen transitions.
+
+        No-op on macOS / Linux / Windows 10 and below.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            dwmapi = ctypes.windll.dwmapi
+            # Set argtypes explicitly: on 64-bit Windows, HWND is 8 bytes
+            # but ctypes defaults to c_int (4 bytes), which truncates the
+            # handle and causes the call to silently target the wrong
+            # window (or fail).
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWA_BORDER_COLOR = 34
+            DWMWCP_DONOTROUND = 1
+            hwnd = int(self.winId())
+
+            # COLORREF for black is 0x00000000 (0x00BBGGRR). This paints
+            # the 1px DWM border black instead of the system accent color
+            # so it vanishes into our dark background in fullscreen.
+            black = ctypes.c_uint(0x00000000)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(black), ctypes.sizeof(black))
+
+            # Force square corners. Without this, Windows 11 rounds the
+            # corners even in fullscreen, leaving transparent gaps in
+            # each corner of the screen.
+            corner_pref = ctypes.c_int(DWMWCP_DONOTROUND)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+        except Exception:
+            # Older Windows (10 and below) doesn't expose these
+            # attributes; the calls return E_INVALIDARG harmlessly.
+            pass
+
     def _strip_native_window_border(self, widget) -> None:
         """On Windows, explicitly remove the extended window styles that
         draw a thin gray edge around top-level windows. Must be called
@@ -1755,6 +1810,12 @@ class VideoGridApp(QMainWindow):
         if not self._was_fullscreen_before_play:
             self.showFullScreen()
 
+        # Re-assert sharp corners + black DWM border after the fullscreen
+        # transition; Windows can reset these on state change, and we
+        # don't want rounded-corner gaps flashing at the screen edges.
+        QTimer.singleShot(0, self._paint_main_window_border_black)
+        QTimer.singleShot(120, self._paint_main_window_border_black)
+
         QTimer.singleShot(60, lambda: self._begin_vlc_playback(path))
 
     def _begin_vlc_playback(self, path: str) -> None:
@@ -2149,6 +2210,15 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "fullscreen_act", None) is not None:
             self.fullscreen_act.setChecked(self.isFullScreen())
 
+    def showEvent(self, event):
+        # The main window's HWND exists by the time showEvent fires, so
+        # this is the first safe moment to ask DWM to paint the 1px
+        # accent border black. Re-applied on state changes below because
+        # Windows may repaint/reset attributes when the window enters
+        # or leaves fullscreen.
+        super().showEvent(event)
+        self._paint_main_window_border_black()
+
     def changeEvent(self, event):
         # The user can leave fullscreen via the OS (e.g. Esc on some
         # desktops, window manager shortcut, Mission Control, etc.). Keep
@@ -2159,8 +2229,11 @@ class VideoGridApp(QMainWindow):
             if getattr(self, "fullscreen_act", None) is not None:
                 self.fullscreen_act.setChecked(self.isFullScreen())
             # Defer the reposition by one event-loop tick so the main
-            # window's geometry has settled into its new state.
+            # window's geometry has settled into its new state, and
+            # re-assert the black DWM border in case Windows reset it
+            # when transitioning into/out of fullscreen.
             QTimer.singleShot(0, self._reposition_visible_overlays)
+            QTimer.singleShot(0, self._paint_main_window_border_black)
         super().changeEvent(event)
 
     def _show_about(self) -> None:
