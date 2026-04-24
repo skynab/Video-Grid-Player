@@ -30,18 +30,31 @@ Dependencies
 
 from __future__ import annotations
 
+import hashlib
 import os
+import random
 import sys
+import tempfile
+from pathlib import Path
+
+# Silence OpenCV's FFmpeg warning spam (e.g. "moov atom not found" that
+# appears on some Windows setups when reading MP4s with non-ASCII paths).
+# Must be set BEFORE cv2 is imported below to take effect.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
 # ---- dependency checks ----------------------------------------------------
 _missing: list[str] = []
 try:
-    from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, pyqtSignal
+    from PyQt6.QtCore import (
+        Qt, QEvent, QPoint, QRectF, QTimer, QThread, pyqtSignal,
+    )
     from PyQt6.QtGui import (
-        QAction, QColor, QImage, QKeySequence, QPalette, QPixmap,
+        QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath,
+        QPalette, QPixmap, QRegion,
     )
     from PyQt6.QtWidgets import (
-        QApplication, QCheckBox, QDialog, QFileDialog, QFrame,
+        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
         QPushButton, QSlider, QSpinBox, QStackedWidget, QVBoxLayout,
         QWidget,
@@ -80,31 +93,229 @@ VIDEO_EXTS = (
     ".wmv", ".flv", ".m4v", ".mpg", ".mpeg", ".ts",
 )
 
-THUMB_W = 320
-THUMB_H = 180
+# Image extensions we'll look for when the "sidecar image" thumbnail
+# option is enabled (e.g. `video.jpg` next to `video.mp4`).
+SIDECAR_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+# User-selectable thumbnail resolution. Each option names the maximum
+# pixel footprint for decoded thumbnails; frames are scaled to fit inside
+# this box while preserving aspect ratio. Higher resolutions look crisper
+# on larger grid cells and high-DPI / 4K monitors at the cost of more
+# memory and a slower initial decode.
+#
+#   Standard (640x360 / 360p)   - light and fast; fine for 1080p monitors
+#                                 and dense grids (e.g. 6x6).
+#   High     (1280x720 / 720p)  - great on 1080p, decent on 4K. Default.
+#   Ultra    (1920x1080 / 1080p)- best on 4K / high-DPI; heaviest footprint.
+THUMB_RES_STANDARD = "standard"
+THUMB_RES_HIGH = "high"
+THUMB_RES_ULTRA = "ultra"
+
+THUMB_RESOLUTIONS: dict[str, tuple[int, int]] = {
+    THUMB_RES_STANDARD: (640, 360),
+    THUMB_RES_HIGH: (1280, 720),
+    THUMB_RES_ULTRA: (1920, 1080),
+}
+THUMB_RES_LABELS: dict[str, str] = {
+    THUMB_RES_STANDARD: "Standard (360p)",
+    THUMB_RES_HIGH: "High (720p)",
+    THUMB_RES_ULTRA: "Ultra (1080p)",
+}
+DEFAULT_THUMB_RES = THUMB_RES_HIGH
+
+
+def thumb_size_for(resolution: str) -> tuple[int, int]:
+    """Look up the (width, height) budget for a thumbnail resolution key,
+    falling back to the default if the key is unknown."""
+    return THUMB_RESOLUTIONS.get(resolution,
+                                 THUMB_RESOLUTIONS[DEFAULT_THUMB_RES])
+
+
+# Minimum on-screen size of each grid cell's thumbnail widget. This is
+# about grid layout, not thumbnail quality — cells can scale up to the
+# full decoded resolution when there's room.
+THUMB_MIN_W = 320
+THUMB_MIN_H = 180
 
 # All title boxes in the grid are pinned to this height so they line up
 # visually, regardless of whether a filename happens to be long or short.
 TITLE_BAR_HEIGHT = 30
 
+# How a thumbnail image should be rendered inside its grid cell.
+# FIT_STRETCH stretches the image to completely fill the cell (ignoring
+# the source's aspect ratio — this is the original behavior).
+# FIT_CLIP scales the image to cover the cell while preserving the
+# source's aspect ratio; any overflow is clipped.
+FIT_STRETCH = "stretch"
+FIT_CLIP = "clip"
+
+
+# ---------------------------------------------------------------------------
+# Thumbnail cache (user-set "use this frame as thumbnail")
+# ---------------------------------------------------------------------------
+def _cache_dir() -> Path:
+    """Per-user cache directory for custom thumbnails that the user has
+    captured via the "Set as Thumbnail" button during playback."""
+    if sys.platform == "win32":
+        base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(base) / "VideoGridPlayer" / "thumbs"
+    return Path.home() / ".cache" / "video_grid_player" / "thumbs"
+
+
+def _cached_thumb_path(video_path: str) -> Path:
+    """Absolute filesystem path where the custom thumbnail for `video_path`
+    is (or would be) stored. Keyed on the absolute video path so moving the
+    video invalidates the cached thumb rather than misusing it."""
+    key = hashlib.sha1(
+        os.path.abspath(video_path).encode("utf-8", "replace")
+    ).hexdigest()
+    return _cache_dir() / (key + ".png")
+
+
+def _find_sidecar_image(video_path: str) -> str | None:
+    """If there's an image file sitting next to `video_path` whose name
+    matches (e.g. `foo.mp4` <-> `foo.jpg`), return its path."""
+    stem = os.path.splitext(video_path)[0]
+    for ext in SIDECAR_IMAGE_EXTS:
+        for candidate in (stem + ext, stem + ext.upper()):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Thumbnail extraction (runs on a worker thread)
 # ---------------------------------------------------------------------------
-def extract_thumbnail(path: str) -> "QImage | None":
+def _cv_safe_path(path: str) -> str:
+    """Return a path OpenCV's Windows file-open can handle without mangling
+    non-ASCII characters.
+
+    OpenCV on Windows opens files through its FFmpeg backend using the
+    narrow (ANSI) Windows file APIs. Any non-ASCII character in the path
+    is silently mistranscoded, so the underlying ``fopen`` ends up
+    reading an entirely different file (or garbage), and FFmpeg reports
+    the infamous ``moov atom not found`` even though the MP4 itself is
+    perfectly fine. The reliable workaround is to translate the path to
+    its Windows 8.3 short form, which is pure ASCII by construction.
+
+    On non-Windows platforms the path is returned unchanged.
+    """
+    if sys.platform != "win32":
+        return path
+    abspath = os.path.abspath(path)
+    # Fast path: if it's already plain ASCII, no translation needed.
+    try:
+        abspath.encode("ascii")
+        return abspath
+    except UnicodeEncodeError:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+        ]
+        GetShortPathNameW.restype = wintypes.DWORD
+        needed = GetShortPathNameW(abspath, None, 0)
+        if needed > 0:
+            buf = ctypes.create_unicode_buffer(needed)
+            if GetShortPathNameW(abspath, buf, needed):
+                return buf.value
+    except Exception as exc:
+        print(f"[thumbnail] short-path lookup failed for {abspath!r}: {exc}")
+    return abspath
+
+
+def _open_video_capture(path: str) -> "cv2.VideoCapture":
+    """Open a video with OpenCV, trying several backends until one
+    actually succeeds.
+
+    Different OpenCV builds ship with different backends available, and
+    on Windows in particular the default backend selection is
+    occasionally broken for MP4s whose paths contain non-ASCII
+    characters. We try FFmpeg first (most capable), then the platform
+    default, then Media Foundation on Windows as a last resort.
+    """
+    safe = _cv_safe_path(path)
+    backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
+    if sys.platform == "win32" and hasattr(cv2, "CAP_MSMF"):
+        backends.append(cv2.CAP_MSMF)
+    last: "cv2.VideoCapture | None" = None
+    for backend in backends:
+        try:
+            cap = cv2.VideoCapture(safe, backend)
+        except Exception as exc:
+            print(f"[thumbnail] backend {backend} raised for {path!r}: {exc}")
+            continue
+        if cap.isOpened():
+            return cap
+        cap.release()
+        last = None
+    # Final fall-through: try the original (non-short) path with the
+    # default backend, in case the short-path translation itself was the
+    # problem (e.g. short names disabled on the volume).
+    if safe != path:
+        try:
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                return cap
+            cap.release()
+        except Exception as exc:
+            print(f"[thumbnail] default-backend retry raised for {path!r}: {exc}")
+    # Return a closed capture so callers can check isOpened() uniformly.
+    return last if last is not None else cv2.VideoCapture()
+
+
+def _fit_rgb_to_qimage(
+    rgb: "np.ndarray",
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage":
+    """Scale an RGB numpy image to fit within the thumbnail resolution's
+    (W, H) budget while preserving aspect ratio, and return a QImage of
+    exactly the scaled size (no letterbox / padding). The display widget
+    decides later whether to stretch this to fill the cell or to
+    scale-and-clip it."""
+    max_w, max_h = thumb_size_for(resolution)
+    h, w = rgb.shape[:2]
+    scale = min(max_w / w, max_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # tobytes() gives us a detached buffer so the returned QImage is safe
+    # to keep around after the numpy array is freed.
+    return QImage(
+        resized.tobytes(), new_w, new_h, new_w * 3,
+        QImage.Format.Format_RGB888,
+    ).copy()
+
+
+def extract_thumbnail(
+    path: str,
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage | None":
     """Grab a representative frame from a video and return it as a
-    letterboxed QImage of size (THUMB_W x THUMB_H)."""
-    cap = cv2.VideoCapture(path)
+    QImage scaled (with aspect preserved) to fit within the budget for
+    `resolution`.
+
+    Returns None if no backend can open the file or no frame can be
+    decoded — the caller treats that as "no thumbnail available" and
+    leaves a placeholder in the grid cell.
+    """
+    cap = _open_video_capture(path)
     if not cap.isOpened():
+        print(f"[thumbnail] could not open video: {path!r}")
         return None
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        # Skip a bit into the file to avoid black intros / studio logos
+        # Skip a bit into the file to avoid black intros / studio logos.
         if total > 1:
             cap.set(cv2.CAP_PROP_POS_FRAMES,
                     max(1, min(total // 10, total - 1)))
         ok, frame = cap.read()
-        if not ok:
+        if not ok or frame is None:
+            # Some streams return False when seeking past the start; try
+            # again from frame 0 before giving up.
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = cap.read()
         if not ok or frame is None:
@@ -113,31 +324,70 @@ def extract_thumbnail(path: str) -> "QImage | None":
         cap.release()
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    scale = min(THUMB_W / w, THUMB_H / h)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return _fit_rgb_to_qimage(rgb, resolution)
 
-    canvas = np.zeros((THUMB_H, THUMB_W, 3), dtype=np.uint8)
-    y = (THUMB_H - new_h) // 2
-    x = (THUMB_W - new_w) // 2
-    canvas[y:y + new_h, x:x + new_w] = resized
 
-    # .copy() detaches from the numpy buffer so the QImage survives GC
-    return QImage(
-        bytes(canvas.data), THUMB_W, THUMB_H, THUMB_W * 3,
-        QImage.Format.Format_RGB888,
-    ).copy()
+def load_image_as_thumb_qimage(
+    path: str,
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage | None":
+    """Load an arbitrary image file (jpg/png/webp/bmp/...) and return a
+    QImage scaled to fit within the chosen resolution's (W, H) budget
+    while preserving aspect ratio. No padding is added — the display
+    widget is responsible for deciding whether to stretch or clip the
+    image inside its cell."""
+    src = QImage(path)
+    if src.isNull():
+        return None
+    src = src.convertToFormat(QImage.Format.Format_RGB888)
+    max_w, max_h = thumb_size_for(resolution)
+    return src.scaled(
+        max_w, max_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def load_thumbnail_for_video(
+    path: str, use_sidecar: bool,
+    resolution: str = DEFAULT_THUMB_RES,
+) -> "QImage | None":
+    """Decide which thumbnail to show for a given video:
+
+    1. A user-set thumbnail from the cache (captured via the "Set as
+       Thumbnail" button during playback) always wins.
+    2. If the sidecar option is on, try a matching image file sitting
+       next to the video (e.g. `clip.jpg` beside `clip.mp4`).
+    3. Otherwise fall back to extracting a frame from the video itself.
+    """
+    cached = _cached_thumb_path(path)
+    if cached.is_file():
+        img = load_image_as_thumb_qimage(str(cached), resolution)
+        if img is not None:
+            return img
+    if use_sidecar:
+        sidecar = _find_sidecar_image(path)
+        if sidecar is not None:
+            img = load_image_as_thumb_qimage(sidecar, resolution)
+            if img is not None:
+                return img
+    return extract_thumbnail(path, resolution)
 
 
 class ThumbnailWorker(QThread):
-    """Extract thumbnails for a list of paths off the GUI thread."""
+    """Resolve thumbnails for a list of paths off the GUI thread.
+
+    For each video we first check the user-set cache, then (optionally) a
+    matching sidecar image, then fall back to decoding a frame from the
+    video itself."""
     thumbnail_ready = pyqtSignal(int, str, QImage)
 
-    def __init__(self, paths: list[str]):
+    def __init__(self, paths: list[str], use_sidecar: bool = False,
+                 resolution: str = DEFAULT_THUMB_RES):
         super().__init__()
         self._paths = paths
+        self._use_sidecar = use_sidecar
+        self._resolution = resolution
         self._stop = False
 
     def stop(self) -> None:
@@ -148,7 +398,8 @@ class ThumbnailWorker(QThread):
             if self._stop:
                 return
             try:
-                img = extract_thumbnail(path)
+                img = load_thumbnail_for_video(
+                    path, self._use_sidecar, self._resolution)
             except Exception as exc:
                 print(f"[thumbnail] error for {path!r}: {exc}")
                 img = None
@@ -186,6 +437,82 @@ class SeekSlider(QSlider):
             self.seek_to.emit(self.value())
 
 
+def apply_rounded_mask(widget, radius: int) -> None:
+    """Clip `widget` to a rounded-rectangle region so the rectangular
+    area outside the rounded corners is not drawn at all.
+
+    We need this because on macOS a widget with WA_NativeWindow gets its
+    own NSView whose backing layer is opaque; Qt's `WA_TranslucentBackground`
+    isn't enough to make the corners transparent in every case. `setMask()`
+    clips at the native-window level, bypassing the alpha-blending path
+    entirely, so the black square behind the rounded shape disappears.
+    """
+    if widget.width() <= 0 or widget.height() <= 0:
+        return
+    radius = max(0, min(radius, min(widget.width(), widget.height()) // 2))
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, widget.width(), widget.height()),
+                        radius, radius)
+    widget.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+class ThumbnailLabel(QLabel):
+    """A QLabel that can render its pixmap in two different modes:
+
+    * FIT_STRETCH - stretch the pixmap to fill the label, ignoring the
+      source's aspect ratio. This matches QLabel's usual
+      setScaledContents(True) behavior.
+    * FIT_CLIP    - scale the pixmap to cover the label while preserving
+      aspect ratio; any overflow on the major axis is clipped.
+
+    While no pixmap is set (e.g. while thumbnails are still loading),
+    painting falls back to the default QLabel rendering so placeholder
+    text like "Loading thumbnail…" still shows up."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fit_mode: str = FIT_STRETCH
+        self._src_pixmap: "QPixmap | None" = None
+
+    def set_fit_mode(self, mode: str) -> None:
+        self._fit_mode = mode
+        self.update()
+
+    def setPixmap(self, pixmap: "QPixmap") -> None:
+        # We store the source and do all the rendering ourselves in
+        # paintEvent, so deliberately don't forward to super().setPixmap
+        # — otherwise QLabel would also try to draw the pixmap at its
+        # natural size.
+        if pixmap is None or pixmap.isNull():
+            self._src_pixmap = None
+        else:
+            self._src_pixmap = pixmap
+        self.update()
+
+    def clear(self) -> None:
+        self._src_pixmap = None
+        super().clear()
+
+    def paintEvent(self, event):
+        # No pixmap yet — let QLabel handle text / placeholder painting.
+        if self._src_pixmap is None or self._src_pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        aspect = (Qt.AspectRatioMode.IgnoreAspectRatio
+                  if self._fit_mode == FIT_STRETCH
+                  else Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        scaled = self._src_pixmap.scaled(
+            self.size(),
+            aspect,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+
+
 class ClickableCell(QFrame):
     """A frame that emits `clicked` when left-clicked."""
     clicked = pyqtSignal()
@@ -215,25 +542,40 @@ class OpenFolderDialog(QDialog):
                  show_titles_default: bool = True,
                  rows_default: int = DEFAULT_GRID_ROWS,
                  cols_default: int = DEFAULT_GRID_COLS,
-                 full_width_default: bool = True):
+                 full_width_default: bool = True,
+                 use_sidecar_default: bool = False,
+                 thumbnail_fit_default: str = FIT_STRETCH,
+                 show_set_thumb_default: bool = True,
+                 auto_hide_default: bool = False,
+                 shuffle_default: bool = False,
+                 thumbnail_resolution_default: str = DEFAULT_THUMB_RES):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(540, 430)
+        self.setFixedSize(560, 535)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
         self.grid_rows: int = rows_default
         self.grid_cols: int = cols_default
         self.full_width: bool = full_width_default
+        self.use_sidecar: bool = use_sidecar_default
+        self.thumbnail_fit: str = thumbnail_fit_default
+        self.show_set_thumb_button: bool = show_set_thumb_default
+        self.auto_hide_overlays: bool = auto_hide_default
+        self.shuffle_play: bool = shuffle_default
+        self.thumbnail_resolution: str = thumbnail_resolution_default
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 20)
+        root.setContentsMargins(22, 18, 22, 16)
+        root.setSpacing(0)
 
         title = QLabel("Video Grid Player")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
             "color: white; font-size: 18px; font-weight: bold;")
         root.addWidget(title)
+
+        root.addSpacing(7)
 
         desc = QLabel(
             "Select a folder containing your video files.\n"
@@ -242,7 +584,7 @@ class OpenFolderDialog(QDialog):
         desc.setStyleSheet("color: #bbbbbb;")
         root.addWidget(desc)
 
-        root.addSpacing(18)
+        root.addSpacing(12)
 
         # --- grid size controls ------------------------------------------
         spin_style = (
@@ -290,7 +632,44 @@ class OpenFolderDialog(QDialog):
         grid_row.addStretch(1)
         root.addLayout(grid_row)
 
-        root.addSpacing(14)
+        root.addSpacing(10)
+
+        # --- thumbnail resolution ----------------------------------------
+        combo_style = (
+            "QComboBox {"
+            "   background: #1a1a1a; color: white; "
+            "   border: 1px solid #444; border-radius: 3px; "
+            "   padding: 4px 8px; font-size: 12px; min-width: 160px;"
+            "}"
+            "QComboBox::drop-down {"
+            "   border: none; width: 18px; "
+            "}"
+            "QComboBox QAbstractItemView {"
+            "   background: #1a1a1a; color: white; "
+            "   selection-background-color: #2b5fa1; "
+            "   border: 1px solid #444;"
+            "}"
+        )
+        res_row = QHBoxLayout()
+        res_row.addStretch(1)
+        res_label = QLabel("Thumbnail quality:")
+        res_label.setStyleSheet(label_style)
+        res_row.addWidget(res_label)
+        self.res_combo = QComboBox()
+        self.res_combo.setStyleSheet(combo_style)
+        self.res_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key in (THUMB_RES_STANDARD, THUMB_RES_HIGH, THUMB_RES_ULTRA):
+            self.res_combo.addItem(THUMB_RES_LABELS[key], key)
+        # Select the current default
+        idx = self.res_combo.findData(thumbnail_resolution_default)
+        if idx < 0:
+            idx = self.res_combo.findData(DEFAULT_THUMB_RES)
+        self.res_combo.setCurrentIndex(max(0, idx))
+        res_row.addWidget(self.res_combo)
+        res_row.addStretch(1)
+        root.addLayout(res_row)
+
+        root.addSpacing(10)
 
         # --- options ------------------------------------------------------
         check_style = (
@@ -313,7 +692,7 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.titles_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addSpacing(8)
+        root.addSpacing(7)
 
         self.full_width_checkbox = QCheckBox(
             "Full-width layout (no gaps between videos)")
@@ -323,7 +702,61 @@ class OpenFolderDialog(QDialog):
         root.addWidget(self.full_width_checkbox, 0,
                        Qt.AlignmentFlag.AlignHCenter)
 
-        root.addStretch(1)
+        root.addSpacing(7)
+
+        self.sidecar_checkbox = QCheckBox(
+            "Use matching image files as thumbnails "
+            "(e.g. video.jpg next to video.mp4)")
+        self.sidecar_checkbox.setChecked(use_sidecar_default)
+        self.sidecar_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidecar_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.sidecar_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.clip_thumb_checkbox = QCheckBox(
+            "Preserve thumbnail aspect ratio "
+            "(clip to fit instead of stretching)")
+        self.clip_thumb_checkbox.setChecked(
+            thumbnail_fit_default == FIT_CLIP)
+        self.clip_thumb_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clip_thumb_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.clip_thumb_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.set_thumb_button_checkbox = QCheckBox(
+            "Show \u201cSet Thumbnail\u201d button while a video is playing")
+        self.set_thumb_button_checkbox.setChecked(show_set_thumb_default)
+        self.set_thumb_button_checkbox.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.set_thumb_button_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.set_thumb_button_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.auto_hide_checkbox = QCheckBox(
+            "Auto-hide on-screen controls after 5 seconds of playback")
+        self.auto_hide_checkbox.setChecked(auto_hide_default)
+        self.auto_hide_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_hide_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.auto_hide_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.shuffle_checkbox = QCheckBox(
+            "Shuffle \u2014 play a random video when the current one ends")
+        self.shuffle_checkbox.setChecked(shuffle_default)
+        self.shuffle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shuffle_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.shuffle_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(14)
 
         # --- buttons ------------------------------------------------------
         row = QHBoxLayout()
@@ -361,6 +794,17 @@ class OpenFolderDialog(QDialog):
             self.grid_rows = self.rows_spin.value()
             self.grid_cols = self.cols_spin.value()
             self.full_width = self.full_width_checkbox.isChecked()
+            self.use_sidecar = self.sidecar_checkbox.isChecked()
+            self.thumbnail_fit = (
+                FIT_CLIP if self.clip_thumb_checkbox.isChecked()
+                else FIT_STRETCH)
+            self.show_set_thumb_button = (
+                self.set_thumb_button_checkbox.isChecked())
+            self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
+            self.shuffle_play = self.shuffle_checkbox.isChecked()
+            res_key = self.res_combo.currentData()
+            if res_key in THUMB_RESOLUTIONS:
+                self.thumbnail_resolution = res_key
             self.accept()
 
 
@@ -378,14 +822,36 @@ class VideoGridApp(QMainWindow):
             "QLabel      { color: white; }"
         )
 
-        # VLC
-        self.vlc_instance = vlc.Instance(["--no-video-title-show"])
+        # VLC.
+        # On Windows we pass a few extra options:
+        #   --vout=direct3d9  is the well-tested Direct3D9 output. It
+        #     honors HWND z-order (so our overlay controls stay on top)
+        #     AND doesn't call the DWM's SetThumbNailClip API that the
+        #     newer direct3d11 vout uses. That call fails with
+        #     0x800706f4 (RPC_X_NULL_REF_POINTER) on embedded child
+        #     HWNDs like ours, and its error path can wedge VLC's
+        #     cleanup when a video ends, causing the whole app to hang.
+        #   --no-mouse-events / --no-keyboard-events  stop VLC from
+        #     swallowing clicks and keys on its own video window so events
+        #     fall through to our overlay buttons.
+        vlc_args = ["--no-video-title-show"]
+        if sys.platform == "win32":
+            vlc_args += [
+                "--vout=direct3d9",
+                "--no-mouse-events",
+                "--no-keyboard-events",
+            ]
+        self.vlc_instance = vlc.Instance(vlc_args)
         self.player = self.vlc_instance.media_player_new()
         em = self.player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerEndReached,
                         self._on_vlc_end)
         em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
                         self._on_vlc_end)
+        em.event_attach(vlc.EventType.MediaPlayerPaused,
+                        self._on_vlc_paused)
+        em.event_attach(vlc.EventType.MediaPlayerPlaying,
+                        self._on_vlc_playing)
 
         # State
         self.video_files: list[str] = []
@@ -397,6 +863,20 @@ class VideoGridApp(QMainWindow):
         self.grid_rows: int = DEFAULT_GRID_ROWS
         self.grid_cols: int = DEFAULT_GRID_COLS
         self.full_width: bool = True      # edge-to-edge layout with no gaps
+        self.use_sidecar_thumbnails: bool = False  # use foo.jpg next to foo.mp4
+        self.thumbnail_fit: str = FIT_STRETCH     # how thumbnails fill cells
+        self.show_set_thumb_button: bool = True   # show/hide overlay button
+        self.auto_hide_overlays: bool = False     # auto-hide after 5 seconds
+        self._overlays_hidden: bool = False       # current hide/show state
+        self.shuffle_play: bool = False           # play random next on end
+        self.thumbnail_resolution: str = DEFAULT_THUMB_RES  # decoded thumb size
+        # Remembered window state across a play→stop cycle. Populated in
+        # _play_video_at so we can restore the pre-playback window state
+        # (fullscreen / maximized / normal) when playback ends.
+        self._was_fullscreen_before_play: bool = False
+        self._was_maximized_before_play: bool = False
+        self.current_video_path: str | None = None
+        self.current_video_idx: int | None = None
 
         # Central pages (grid / video) in a stack
         self.stack = QStackedWidget()
@@ -405,7 +885,10 @@ class VideoGridApp(QMainWindow):
         self._build_grid_page()
         self._build_video_page()
         self._build_close_overlay()
+        self._build_set_thumb_overlay()
         self._build_jog_overlay()
+        self._build_overlay_toggle()
+        self._build_auto_hide_timer()
         self.stack.setCurrentWidget(self.grid_page)
 
         self._render_grid()
@@ -425,6 +908,15 @@ class VideoGridApp(QMainWindow):
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(self._show_open_dialog)
         file_menu.addAction(open_act)
+        file_menu.addSeparator()
+        # Full Screen toggle. Checkable so the menu reflects the current
+        # state. Uses the platform standard shortcut (F11 on Windows/Linux,
+        # Ctrl+Cmd+F on macOS).
+        self.fullscreen_act = QAction("Full Screen", self)
+        self.fullscreen_act.setCheckable(True)
+        self.fullscreen_act.setShortcut(QKeySequence.StandardKey.FullScreen)
+        self.fullscreen_act.triggered.connect(self._toggle_fullscreen)
+        file_menu.addAction(self.fullscreen_act)
         file_menu.addSeparator()
         exit_act = QAction("Exit", self)
         exit_act.setShortcut(QKeySequence.StandardKey.Quit)
@@ -467,12 +959,179 @@ class VideoGridApp(QMainWindow):
 
         self.stack.addWidget(self.video_page)
 
+    # --------- overlay window helpers ---------------------------------------
+    def _promote_to_overlay_window(self, widget) -> None:
+        """Make `widget` a top-level frameless Tool window that floats
+        above the main window.
+
+        Rationale: on Windows, even with WA_NativeWindow + raise_(), the
+        VLC video surface (a hardware-accelerated child HWND) can end up
+        drawn above sibling HWNDs in ways that hide our overlay controls.
+        Promoting the controls to separate top-level windows gives each
+        one its own HWND at a different level of the window hierarchy,
+        where it is trivially above the main window's content on every
+        platform. The widget keeps the main window as its Qt parent, so
+        Qt automatically hides/shows it with the parent and it doesn't
+        get a taskbar entry (because of Qt.Tool).
+
+        CustomizeWindowHint tells Qt to honor ONLY the hints we've set
+        here — without it, Windows still draws a thin gray client-edge
+        border around the window even though FramelessWindowHint is on.
+        """
+        widget.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        widget.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        widget.setAutoFillBackground(False)
+
+    def _paint_main_window_border_black(self) -> None:
+        """On Windows 11, every top-level window gets a 1px accent-color
+        border *and* 8px rounded corners painted by DWM. In fullscreen
+        the border shows as a thin transparent/colored seam, and the
+        rounded corners leave small gaps in each corner that don't
+        belong in a fullscreen video player.
+
+        Tell DWM to paint the border black (blends into the dark app
+        background) and to not round corners. Re-applied on every
+        window state change because Windows sometimes resets these
+        attributes during fullscreen transitions.
+
+        No-op on macOS / Linux / Windows 10 and below.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            dwmapi = ctypes.windll.dwmapi
+            # Set argtypes explicitly: on 64-bit Windows, HWND is 8 bytes
+            # but ctypes defaults to c_int (4 bytes), which truncates the
+            # handle and causes the call to silently target the wrong
+            # window (or fail).
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWA_BORDER_COLOR = 34
+            DWMWCP_DONOTROUND = 1
+            hwnd = int(self.winId())
+
+            # COLORREF for black is 0x00000000 (0x00BBGGRR). This paints
+            # the 1px DWM border black instead of the system accent color
+            # so it vanishes into our dark background in fullscreen.
+            black = ctypes.c_uint(0x00000000)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(black), ctypes.sizeof(black))
+
+            # Force square corners. Without this, Windows 11 rounds the
+            # corners even in fullscreen, leaving transparent gaps in
+            # each corner of the screen.
+            corner_pref = ctypes.c_int(DWMWCP_DONOTROUND)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+        except Exception:
+            # Older Windows (10 and below) doesn't expose these
+            # attributes; the calls return E_INVALIDARG harmlessly.
+            pass
+
+    def _strip_native_window_border(self, widget) -> None:
+        """On Windows, explicitly remove the extended window styles that
+        draw a thin gray edge around top-level windows. Must be called
+        after the widget's native HWND exists (i.e. after show()).
+
+        No-op on macOS / Linux.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            hwnd = int(widget.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_CLIENTEDGE = 0x00000200
+            WS_EX_STATICEDGE = 0x00020000
+            WS_EX_DLGMODALFRAME = 0x00000001
+            WS_EX_WINDOWEDGE = 0x00000100
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            GetWindowLongW = user32.GetWindowLongW
+            GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            GetWindowLongW.restype = ctypes.c_long
+            SetWindowLongW = user32.SetWindowLongW
+            SetWindowLongW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            SetWindowLongW.restype = ctypes.c_long
+            ex = GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new_ex = ex & ~(
+                WS_EX_CLIENTEDGE
+                | WS_EX_STATICEDGE
+                | WS_EX_DLGMODALFRAME
+                | WS_EX_WINDOWEDGE
+            )
+            if new_ex != ex:
+                SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
+                user32.SetWindowPos(
+                    hwnd, 0, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                    | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                )
+        except Exception as exc:
+            print(f"[overlay] could not strip window border: {exc}")
+
+        # Windows 11 paints a thin 1px "accent color" border around every
+        # top-level window by default, even frameless ones. The only way
+        # to remove it is to tell DWM to use DWMWA_COLOR_NONE for the
+        # border color, and to disable Windows 11's automatic rounded
+        # corners (we draw our own via setMask). These attributes don't
+        # exist pre-Windows-11 — the calls just return E_INVALIDARG and
+        # are harmless.
+        try:
+            import ctypes
+            dwmapi = ctypes.windll.dwmapi
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWA_BORDER_COLOR = 34
+            DWMWCP_DONOTROUND = 1
+            DWMWA_COLOR_NONE = 0xFFFFFFFE
+            corner_pref = ctypes.c_int(DWMWCP_DONOTROUND)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+            border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(border_color), ctypes.sizeof(border_color))
+        except Exception:
+            # Older Windows (10 and below) doesn't expose these
+            # attributes; silently fall through.
+            pass
+
+    def _place_overlay(self, widget, x_local: int, y_local: int) -> None:
+        """Move a promoted top-level overlay to `(x_local, y_local)` given
+        in this window's local coordinate space. Because overlays are
+        top-level windows, `move()` takes global screen coordinates — so
+        we translate before moving."""
+        gp = self.mapToGlobal(QPoint(max(0, x_local), max(0, y_local)))
+        widget.move(gp)
+
     def _build_close_overlay(self) -> None:
         """Floating X button shown over the video while playing.
 
-        Parented to the main window (not the stack page) and given its
-        own native surface via WA_NativeWindow so it composites cleanly
-        on top of VLC's video output on every platform.
+        Implemented as a top-level frameless Tool window so it reliably
+        floats above VLC's native video surface on every platform.
         """
         self.close_button = QPushButton("✕", self)
         self.close_button.setObjectName("closeOverlay")
@@ -480,26 +1139,27 @@ class VideoGridApp(QMainWindow):
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_button.setToolTip("Close video and return to grid (Esc)")
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.close_button.setAttribute(
-            Qt.WidgetAttribute.WA_NativeWindow, True)
+        self._promote_to_overlay_window(self.close_button)
         self.close_button.setStyleSheet(
             "#closeOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
             "  color: white;"
-            "  border: 2px solid rgba(255, 255, 255, 90);"
+            "  border: none;"
             "  border-radius: 24px;"
             "  font-size: 22px;"
             "  font-weight: bold;"
             "}"
             "#closeOverlay:hover {"
             "  background-color: rgba(210, 50, 50, 220);"
-            "  border: 2px solid rgba(255, 255, 255, 180);"
             "}"
             "#closeOverlay:pressed {"
             "  background-color: rgba(170, 30, 30, 230);"
             "}"
         )
         self.close_button.clicked.connect(self._stop_playback)
+        # Clip to a 48×48 circle so macOS's opaque native backing doesn't
+        # show as a black square around the X.
+        apply_rounded_mask(self.close_button, 24)
         self.close_button.hide()
 
     def _position_close_button(self) -> None:
@@ -507,8 +1167,63 @@ class VideoGridApp(QMainWindow):
         margin = 20
         x = self.width() - self.close_button.width() - margin
         y = margin
-        self.close_button.move(max(0, x), max(0, y))
+        self._place_overlay(self.close_button, x, y)
         self.close_button.raise_()
+
+    # ---------------------------------------------- "Set Thumbnail" overlay --
+    def _build_set_thumb_overlay(self) -> None:
+        """A pill-shaped button overlaid on the top-right of the video that
+        captures the current frame and uses it as the grid thumbnail for
+        the video being played. It sits just to the left of the ✕ button.
+        """
+        self.set_thumb_button = QPushButton("\u25A3  Set Thumbnail", self)
+        self.set_thumb_button.setObjectName("setThumbOverlay")
+        self.set_thumb_button.setFixedHeight(40)
+        self.set_thumb_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.set_thumb_button.setToolTip(
+            "Use the current frame as this video's grid thumbnail")
+        self.set_thumb_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._promote_to_overlay_window(self.set_thumb_button)
+        self.set_thumb_button.setStyleSheet(
+            "#setThumbOverlay {"
+            "  background-color: rgba(0, 0, 0, 170);"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: 20px;"
+            "  font-size: 13px;"
+            "  font-weight: bold;"
+            "  padding: 0 18px;"
+            "}"
+            "#setThumbOverlay:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "}"
+            "#setThumbOverlay:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.set_thumb_button.clicked.connect(
+            self._capture_current_frame_as_thumbnail)
+        self.set_thumb_button.hide()
+
+    def _position_set_thumb_button(self) -> None:
+        """Pin the 'Set Thumbnail' button just to the left of the ✕ button."""
+        margin = 20
+        gap = 12
+        self.set_thumb_button.adjustSize()
+        # adjustSize() respects text width but we forced a fixed height earlier.
+        self.set_thumb_button.setFixedHeight(40)
+        # Compute the close button's position in OUR local coord space
+        # (close_button is a top-level window, so its .x()/.y() are global).
+        close_local = self.mapFromGlobal(
+            QPoint(self.close_button.x(), self.close_button.y()))
+        x = close_local.x() - self.set_thumb_button.width() - gap
+        y = margin + (self.close_button.height() - 40) // 2
+        self._place_overlay(self.set_thumb_button, x, y)
+        # Re-apply the pill mask every time the width changes (the button
+        # is resized by adjustSize() when the text changes between ▣ Set
+        # Thumbnail and ✓ Thumbnail Set).
+        apply_rounded_mask(self.set_thumb_button, 20)
+        self.set_thumb_button.raise_()
 
     # ------------------------------------------------ jog / transport bar --
     def _build_jog_overlay(self) -> None:
@@ -518,9 +1233,7 @@ class VideoGridApp(QMainWindow):
         native surface so it draws cleanly on top of native video."""
         self.jog_bar = QWidget(self)
         self.jog_bar.setObjectName("jogBar")
-        self.jog_bar.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.jog_bar.setAttribute(
-            Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self._promote_to_overlay_window(self.jog_bar)
         self.jog_bar.setStyleSheet(
             "#jogBar { background-color: rgba(0, 0, 0, 180); "
             "          border-radius: 10px; }"
@@ -529,6 +1242,36 @@ class VideoGridApp(QMainWindow):
         bar_layout = QHBoxLayout(self.jog_bar)
         bar_layout.setContentsMargins(18, 10, 18, 10)
         bar_layout.setSpacing(14)
+
+        # Pause / resume button — lives at the left end of the transport
+        # bar. Uses Unicode media glyphs (⏸ / ▶) so we don't need an icon
+        # file. The button toggles VLC's paused state; its label is also
+        # kept in sync with VLC via MediaPlayerPaused/Playing events so it
+        # still reflects reality when Space is used instead.
+        self.pause_button = QPushButton("\u23F8")
+        self.pause_button.setObjectName("pauseBtn")
+        self.pause_button.setFixedSize(36, 36)
+        self.pause_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pause_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pause_button.setToolTip("Pause / resume (Space)")
+        self.pause_button.setStyleSheet(
+            "#pauseBtn {"
+            "  background-color: rgba(255, 255, 255, 30);"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: 18px;"
+            "  font-size: 15px;"
+            "  padding: 0;"
+            "}"
+            "#pauseBtn:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "}"
+            "#pauseBtn:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.pause_button.clicked.connect(self._toggle_pause)
+        bar_layout.addWidget(self.pause_button)
 
         self.time_current = QLabel("0:00")
         self.time_current.setStyleSheet(
@@ -587,15 +1330,137 @@ class VideoGridApp(QMainWindow):
     def _position_jog_bar(self) -> None:
         """Pin the transport bar to the bottom-center of the window."""
         margin_x = 40
-        margin_y = 32
+        # Leave enough room below the jog bar for the chevron toggle to
+        # sit "under the timeline" without falling off the screen.
+        margin_y = 52
         bar_height = 56
         bar_width = max(360, self.width() - 2 * margin_x)
         self.jog_bar.setFixedHeight(bar_height)
         self.jog_bar.setFixedWidth(bar_width)
         x = (self.width() - bar_width) // 2
         y = self.height() - bar_height - margin_y
-        self.jog_bar.move(max(0, x), max(0, y))
+        self._place_overlay(self.jog_bar, x, y)
+        # Re-mask on every resize so the rounded pill shape stays clipped
+        # instead of leaking a black rectangle over the video on macOS.
+        apply_rounded_mask(self.jog_bar, 10)
         self.jog_bar.raise_()
+
+    # ------------------------------------------ chevron hide/show toggle --
+    def _build_overlay_toggle(self) -> None:
+        """A small pill-shaped button anchored just below the timeline.
+        Pressing it hides every on-screen control (timeline, pause, close,
+        "Set Thumbnail") leaving only this button visible, which now shows
+        an up-chevron so it can restore the controls on the next press."""
+        self.overlay_toggle = QPushButton("\u25BE", self)   # ▾
+        self.overlay_toggle.setObjectName("overlayToggle")
+        self.overlay_toggle.setFixedSize(56, 28)
+        self.overlay_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.overlay_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self._promote_to_overlay_window(self.overlay_toggle)
+        self.overlay_toggle.setStyleSheet(
+            "#overlayToggle {"
+            "  background-color: rgba(0, 0, 0, 170);"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: 14px;"
+            "  font-size: 16px;"
+            "  font-weight: bold;"
+            "  padding: 0;"
+            "}"
+            "#overlayToggle:hover {"
+            "  background-color: rgba(43, 95, 161, 220);"
+            "}"
+            "#overlayToggle:pressed {"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}"
+        )
+        self.overlay_toggle.clicked.connect(self._toggle_overlays)
+        apply_rounded_mask(self.overlay_toggle, 14)
+        self.overlay_toggle.hide()
+
+    def _position_overlay_toggle(self) -> None:
+        """Center the chevron button just below the jog bar. When the jog
+        bar is hidden, pin the chevron near the bottom of the screen
+        instead so the user still has a way to bring the controls back."""
+        w = self.overlay_toggle.width()
+        h = self.overlay_toggle.height()
+        x = (self.width() - w) // 2
+        if self.jog_bar.isVisible():
+            # jog_bar is a top-level window now, so its .y() is a global
+            # coord — translate into our local space first.
+            jog_local = self.mapFromGlobal(
+                QPoint(self.jog_bar.x(), self.jog_bar.y()))
+            y = jog_local.y() + self.jog_bar.height() + 6
+        else:
+            y = self.height() - h - 14
+        # Guard against falling off-screen in weird window sizes
+        y = max(0, min(y, self.height() - h - 2))
+        self._place_overlay(self.overlay_toggle, x, y)
+        self.overlay_toggle.raise_()
+
+    def _build_auto_hide_timer(self) -> None:
+        """Single-shot timer that fires 5 seconds after playback begins
+        (or after the user reveals the controls) to auto-collapse the
+        overlays, when the 'auto-hide controls' option is enabled."""
+        self.auto_hide_timer = QTimer(self)
+        self.auto_hide_timer.setSingleShot(True)
+        self.auto_hide_timer.setInterval(5000)
+        self.auto_hide_timer.timeout.connect(self._auto_hide_fire)
+
+    def _toggle_overlays(self) -> None:
+        if self._overlays_hidden:
+            self._reveal_overlays()
+            # Give the user a fresh 5-second window before auto-hide
+            # takes them away again.
+            if self.auto_hide_overlays and self.is_playing:
+                self.auto_hide_timer.start()
+        else:
+            self._hide_overlays()
+
+    def _hide_overlays(self) -> None:
+        """Hide the timeline, pause, close, and Set Thumbnail buttons.
+        The chevron toggle stays visible so the user can bring them back."""
+        if not self.is_playing:
+            return
+        self._overlays_hidden = True
+        self.jog_bar.hide()
+        self.close_button.hide()
+        self.set_thumb_button.hide()
+        self.overlay_toggle.setText("\u25B4")       # ▴
+        self.overlay_toggle.setToolTip("Show on-screen controls")
+        # Chevron is now on its own at the bottom — reposition accordingly.
+        self._position_overlay_toggle()
+        self.auto_hide_timer.stop()
+
+    def _reveal_overlays(self) -> None:
+        """Restore whatever overlays were visible before _hide_overlays().
+        Respects the "Show Set Thumbnail button" preference."""
+        self._overlays_hidden = False
+        self._position_close_button()
+        self.close_button.show()
+        self.close_button.raise_()
+        if self.show_set_thumb_button:
+            self._position_set_thumb_button()
+            self.set_thumb_button.show()
+            self.set_thumb_button.raise_()
+        self._position_jog_bar()
+        self.jog_bar.show()
+        self.jog_bar.raise_()
+        self.overlay_toggle.setText("\u25BE")       # ▾
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self._position_overlay_toggle()
+
+    def _auto_hide_fire(self) -> None:
+        """5-second timer elapsed — hide overlays unless the user is
+        currently scrubbing the timeline (in which case retry later)."""
+        if not self.is_playing or self._overlays_hidden:
+            return
+        if self.timeline.isSliderDown():
+            # Don't yank the scrubber out from under the user's cursor.
+            self.auto_hide_timer.start()
+            return
+        self._hide_overlays()
 
     @staticmethod
     def _format_time(ms: int) -> str:
@@ -661,12 +1526,24 @@ class VideoGridApp(QMainWindow):
             rows_default=self.grid_rows,
             cols_default=self.grid_cols,
             full_width_default=self.full_width,
+            use_sidecar_default=self.use_sidecar_thumbnails,
+            thumbnail_fit_default=self.thumbnail_fit,
+            show_set_thumb_default=self.show_set_thumb_button,
+            auto_hide_default=self.auto_hide_overlays,
+            shuffle_default=self.shuffle_play,
+            thumbnail_resolution_default=self.thumbnail_resolution,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
             self.grid_rows = dlg.grid_rows
             self.grid_cols = dlg.grid_cols
             self.full_width = dlg.full_width
+            self.use_sidecar_thumbnails = dlg.use_sidecar
+            self.thumbnail_fit = dlg.thumbnail_fit
+            self.show_set_thumb_button = dlg.show_set_thumb_button
+            self.auto_hide_overlays = dlg.auto_hide_overlays
+            self.shuffle_play = dlg.shuffle_play
+            self.thumbnail_resolution = dlg.thumbnail_resolution
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -698,7 +1575,11 @@ class VideoGridApp(QMainWindow):
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
-        self.thumb_worker = ThumbnailWorker(list(self.video_files))
+        self.thumb_worker = ThumbnailWorker(
+            list(self.video_files),
+            use_sidecar=self.use_sidecar_thumbnails,
+            resolution=self.thumbnail_resolution,
+        )
         self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail)
         self.thumb_worker.start()
 
@@ -782,15 +1663,17 @@ class VideoGridApp(QMainWindow):
             layout.setContentsMargins(10, 10, 10, 10)
             layout.setSpacing(8)
 
-        thumb = QLabel("Loading thumbnail…")
+        # ThumbnailLabel renders the pixmap in either FIT_STRETCH (distort
+        # to fill) or FIT_CLIP (keep aspect ratio, clip to fill) — the
+        # mode is chosen by the user in the open-folder popup.
+        thumb = ThumbnailLabel()
+        thumb.setText("Loading thumbnail…")
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.set_fit_mode(self.thumbnail_fit)
         if self.full_width:
-            # Let the thumbnail stretch to fill the entire cell edge-to-edge.
             thumb.setMinimumSize(1, 1)
-            thumb.setScaledContents(True)
         else:
-            thumb.setMinimumSize(THUMB_W, THUMB_H)
-            thumb.setScaledContents(False)
+            thumb.setMinimumSize(THUMB_MIN_W, THUMB_MIN_H)
         thumb.setStyleSheet(
             "background: black; color: #777777; "
             "font-size: 11px; border: none;")
@@ -906,13 +1789,32 @@ class VideoGridApp(QMainWindow):
         if self.is_playing:
             return
         self.is_playing = True
+        self.current_video_path = path
+        try:
+            self.current_video_idx = self.video_files.index(path)
+        except ValueError:
+            self.current_video_idx = None
+
+        # Remember what the main window's display state was before we
+        # force-fullscreen it for playback, so we can restore it on stop
+        # instead of dropping the user out of fullscreen if that's where
+        # they already were.
+        self._was_fullscreen_before_play = self.isFullScreen()
+        self._was_maximized_before_play = self.isMaximized()
 
         # Switch to the video page so the surface is laid out & visible,
         # then go fullscreen, then give Qt one event-loop tick so the
         # native surface is definitely realized before handing its
         # handle to VLC.
         self.stack.setCurrentWidget(self.video_page)
-        self.showFullScreen()
+        if not self._was_fullscreen_before_play:
+            self.showFullScreen()
+
+        # Re-assert sharp corners + black DWM border after the fullscreen
+        # transition; Windows can reset these on state change, and we
+        # don't want rounded-corner gaps flashing at the screen edges.
+        QTimer.singleShot(0, self._paint_main_window_border_black)
+        QTimer.singleShot(120, self._paint_main_window_border_black)
 
         QTimer.singleShot(60, lambda: self._begin_vlc_playback(path))
 
@@ -929,6 +1831,15 @@ class VideoGridApp(QMainWindow):
             # which is exactly what libvlc's set_nsobject expects.
             self.player.set_nsobject(handle)
 
+        # Stop VLC from grabbing mouse/keyboard input on the video surface.
+        # Without this, on Windows the video window eats clicks that were
+        # aimed at our overlay controls, so buttons appear "stuck behind".
+        try:
+            self.player.video_set_mouse_input(False)
+            self.player.video_set_key_input(False)
+        except Exception:
+            pass
+
         media = self.vlc_instance.media_new(path)
         self.player.set_media(media)
         self.player.play()
@@ -937,7 +1848,17 @@ class VideoGridApp(QMainWindow):
         # of the video.
         self._position_close_button()
         self.close_button.show()
-        self.close_button.raise_()
+
+        # Reset the "Set Thumbnail" button label in case it was showing
+        # the "✓ Thumbnail Set" confirmation from a previous play, then
+        # show it to the left of the ✕ button — but only if the user has
+        # the "Show Set Thumbnail button" option enabled in the popup.
+        self.set_thumb_button.setText("\u25A3  Set Thumbnail")
+        if self.show_set_thumb_button:
+            self._position_set_thumb_button()
+            self.set_thumb_button.show()
+        else:
+            self.set_thumb_button.hide()
 
         # Reset and reveal the jog/transport bar
         self.timeline.blockSignals(True)
@@ -945,27 +1866,284 @@ class VideoGridApp(QMainWindow):
         self.timeline.blockSignals(False)
         self.time_current.setText("0:00")
         self.time_total.setText("0:00")
+        self._set_pause_button_state(paused=False)
         self._position_jog_bar()
         self.jog_bar.show()
-        self.jog_bar.raise_()
         self.position_timer.start()
+
+        # Controls are visible at the start of each playback; reset the
+        # chevron to its "press to hide" state and show it under the bar.
+        self._overlays_hidden = False
+        self.overlay_toggle.setText("\u25BE")     # ▾
+        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self._position_overlay_toggle()
+        self.overlay_toggle.show()
+
+        # Raise all overlays above the video surface. On Windows VLC may
+        # briefly take the top of the child z-order when its rendering
+        # surface is created, so we also schedule a few deferred re-raises
+        # covering the first ~1s of playback as a safety net.
+        self._raise_all_overlays()
+        for delay in (50, 150, 350, 700, 1200):
+            QTimer.singleShot(delay, self._raise_all_overlays)
+
+        # If the user asked for auto-hide, start the 5-second countdown.
+        if self.auto_hide_overlays:
+            self.auto_hide_timer.start()
+
+    def _raise_all_overlays(self) -> None:
+        """Bring every overlay widget above the video surface in native
+        window z-order. Used on every play-start and also from the VLC
+        'Playing' event, because on Windows the VLC surface can take the
+        top of the z-order mid-initialization and hide our controls.
+
+        Also strips the native Windows client-edge style off each overlay
+        (a no-op on macOS/Linux), which removes the thin gray border
+        that Windows would otherwise draw around a top-level Tool
+        window. Idempotent — fine to call repeatedly.
+        """
+        if not self.is_playing:
+            return
+        for widget_attr, visibility_guard in (
+            ("close_button", lambda: True),
+            ("set_thumb_button", lambda: self.show_set_thumb_button
+                and not self._overlays_hidden),
+            ("jog_bar", lambda: not self._overlays_hidden),
+            ("overlay_toggle", lambda: True),
+        ):
+            w = getattr(self, widget_attr, None)
+            if w is None or not w.isVisible():
+                continue
+            if not visibility_guard():
+                continue
+            try:
+                w.raise_()
+            except Exception:
+                pass
+            self._strip_native_window_border(w)
+
+    def _capture_current_frame_as_thumbnail(self) -> None:
+        """Snapshot whatever VLC is currently showing and use it as the
+        grid thumbnail for the video being played. The PNG is cached in
+        a per-user directory keyed on the video's absolute path, so the
+        custom thumbnail is still there next time this folder is opened.
+        """
+        if not self.is_playing or self.current_video_path is None:
+            return
+
+        # Make sure the cache dir exists before we write into it.
+        cache_dir = _cache_dir()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Set Thumbnail",
+                f"Couldn't create thumbnail cache directory:\n{exc}")
+            return
+
+        # Have VLC write the current frame to a temp PNG. Using a temp
+        # file first avoids leaving a half-written cache entry behind if
+        # anything goes wrong mid-write; we move it into place on success.
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".png", prefix="vgp_snap_")
+        os.close(tmp_fd)
+        rc = -1
+        try:
+            rc = self.player.video_take_snapshot(0, tmp_path, 0, 0)
+        except Exception as exc:
+            print(f"[snapshot] VLC error: {exc}")
+
+        if rc != 0 or (not os.path.isfile(tmp_path)
+                       or os.path.getsize(tmp_path) == 0):
+            # Snapshot failed (VLC not ready, video output not available,
+            # etc.). Clean up the empty temp file and bail out.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            QMessageBox.warning(
+                self, "Set Thumbnail",
+                "Couldn't capture the current frame. "
+                "Try again a moment after playback begins.")
+            return
+
+        # Load the snapshot, letterbox it to our standard thumb size,
+        # and persist it to the cache as <sha1(path)>.png.
+        thumb_qimg = load_image_as_thumb_qimage(
+            tmp_path, self.thumbnail_resolution)
+        dest = _cached_thumb_path(self.current_video_path)
+        try:
+            os.replace(tmp_path, dest)
+        except OSError as exc:
+            print(f"[snapshot] could not move to cache: {exc}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        if thumb_qimg is None:
+            return
+
+        # Update the live grid cell so the new thumbnail appears as soon
+        # as the user returns to the grid.
+        pixmap = QPixmap.fromImage(thumb_qimg)
+        self.thumbnails[self.current_video_path] = pixmap
+        idx = self.current_video_idx
+        if (idx is not None and 0 <= idx < len(self.cell_widgets)
+                and self.cell_widgets[idx] is not None):
+            entry = self.cell_widgets[idx]
+            entry["thumb"].setPixmap(pixmap)
+            entry["thumb"].setText("")
+
+        # Brief on-screen confirmation so the user knows it worked.
+        self.set_thumb_button.setText("\u2713  Thumbnail Set")
+        QTimer.singleShot(
+            1400,
+            lambda: self.set_thumb_button.setText("\u25A3  Set Thumbnail"))
+
+    def _toggle_pause(self) -> None:
+        """Toggle VLC's paused state and refresh the button label."""
+        if not self.is_playing:
+            return
+        try:
+            self.player.pause()      # libvlc's pause() is a toggle
+        except Exception:
+            pass
+        # Optimistically flip the label right away so the button feels
+        # responsive. The VLC Paused/Playing events will fire shortly
+        # after and confirm (or correct) the state.
+        if self.pause_button.text() == "\u23F8":
+            self._set_pause_button_state(paused=True)
+        else:
+            self._set_pause_button_state(paused=False)
+
+    def _set_pause_button_state(self, paused: bool) -> None:
+        if paused:
+            self.pause_button.setText("\u25B6")        # ▶
+            self.pause_button.setToolTip("Resume (Space)")
+        else:
+            self.pause_button.setText("\u23F8")        # ⏸
+            self.pause_button.setToolTip("Pause (Space)")
+
+    def _on_vlc_paused(self, _event) -> None:
+        # VLC events fire on VLC's thread — bounce back to the GUI thread.
+        QTimer.singleShot(
+            0, lambda: self._set_pause_button_state(paused=True))
+
+    def _on_vlc_playing(self, _event) -> None:
+        # Fires on VLC's thread. Bounce to the GUI thread and, as well as
+        # syncing the pause button, re-raise our overlays — VLC's first
+        # frame on Windows often pushes its rendering surface to the top
+        # of the child z-order and would otherwise hide the controls.
+        def _on_gui_thread() -> None:
+            self._set_pause_button_state(paused=False)
+            self._raise_all_overlays()
+        QTimer.singleShot(0, _on_gui_thread)
 
     def _on_vlc_end(self, _event) -> None:
         # Fires on VLC's thread — defer UI updates to the Qt main loop
-        QTimer.singleShot(80, self._stop_playback)
+        QTimer.singleShot(80, self._handle_video_ended)
+
+    def _handle_video_ended(self) -> None:
+        """Called on the GUI thread when the currently-playing video ends
+        (or errors out). If shuffle is enabled, pick a random next video
+        and continue playing. Otherwise return to the grid."""
+        if (self.shuffle_play
+                and self.is_playing
+                and len(self.video_files) >= 1):
+            self._play_next_shuffled()
+        else:
+            self._stop_playback()
+
+    def _play_next_shuffled(self) -> None:
+        """Pick a random video from the loaded list (avoiding the one that
+        just finished if we have more than one) and start it without
+        returning to the grid. Preserves the current hide/show state of
+        the overlays so a shuffle session can stay "clean" if the user
+        has collapsed the controls."""
+        current = self.current_video_path
+        choices = [v for v in self.video_files if v != current]
+        if not choices:
+            choices = list(self.video_files)
+        if not choices:
+            self._stop_playback()
+            return
+
+        next_path = random.choice(choices)
+        was_hidden = self._overlays_hidden
+
+        # Tear down timers / VLC state tied to the outgoing video, but
+        # keep is_playing=True and stay on the video page / fullscreen.
+        self.position_timer.stop()
+        self.auto_hide_timer.stop()
+        self._stop_vlc_player()
+
+        self.current_video_path = next_path
+        try:
+            self.current_video_idx = self.video_files.index(next_path)
+        except ValueError:
+            self.current_video_idx = None
+
+        # Kick off the new video through the same path as a fresh play.
+        QTimer.singleShot(
+            60, lambda p=next_path: self._begin_vlc_playback(p))
+        # _begin_vlc_playback unconditionally re-shows the overlays;
+        # if the user had them collapsed, re-hide after things settle.
+        if was_hidden:
+            QTimer.singleShot(140, self._hide_overlays)
+
+    def _stop_vlc_player(self) -> None:
+        """Stop the VLC player safely.
+
+        Before calling stop() we detach the native render surface by
+        passing a null handle. This gives VLC a clean signal to release
+        its renderer and avoids a class of Windows hangs where the vout
+        module blocks trying to clip a DWM taskbar thumbnail against a
+        disappearing HWND (the old ``SetThumbNailClip 0x800706f4``
+        symptom with the d3d11 output). Harmless on macOS/Linux.
+        """
+        try:
+            if sys.platform == "win32":
+                self.player.set_hwnd(0)
+            elif sys.platform.startswith("linux"):
+                self.player.set_xwindow(0)
+            elif sys.platform == "darwin":
+                self.player.set_nsobject(0)
+        except Exception:
+            pass
+        try:
+            self.player.stop()
+        except Exception:
+            pass
 
     def _stop_playback(self) -> None:
         if not self.is_playing:
             return
         self.is_playing = False
         self.position_timer.stop()
+        self.auto_hide_timer.stop()
         self.close_button.hide()
+        self.set_thumb_button.hide()
         self.jog_bar.hide()
-        try:
-            self.player.stop()
-        except Exception:
+        self.overlay_toggle.hide()
+        self._overlays_hidden = False
+        self._stop_vlc_player()
+        self.current_video_path = None
+        self.current_video_idx = None
+        # Restore whichever window state we had before playback began.
+        # If the user was already in fullscreen before playing a video,
+        # we stay in fullscreen rather than yanking them out of it.
+        if getattr(self, "_was_fullscreen_before_play", False):
+            # Already fullscreen from _play_video_at (or from earlier);
+            # don't touch the window state.
             pass
-        self.showNormal()
+        elif getattr(self, "_was_maximized_before_play", False):
+            self.showMaximized()
+        else:
+            self.showNormal()
+        # Keep the File menu's Full Screen toggle in sync.
+        if getattr(self, "fullscreen_act", None) is not None:
+            self.fullscreen_act.setChecked(self.isFullScreen())
         self.stack.setCurrentWidget(self.grid_page)
 
     # -------------------------------------------------------------- keyboard --
@@ -974,7 +2152,7 @@ class VideoGridApp(QMainWindow):
         if self.is_playing and key == Qt.Key.Key_Escape:
             self._stop_playback()
         elif self.is_playing and key == Qt.Key.Key_Space:
-            self.player.pause()
+            self._toggle_pause()
         elif self.is_playing and key == Qt.Key.Key_Left:
             self._seek_relative(-5000)        # back 5 seconds
         elif self.is_playing and key == Qt.Key.Key_Right:
@@ -985,34 +2163,104 @@ class VideoGridApp(QMainWindow):
     # ---------------------------------------------------------------- resize --
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Keep the floating overlays pinned to their corners on every resize
+        self._reposition_visible_overlays()
+
+    def moveEvent(self, event):
+        # Overlays are top-level windows positioned in global coords, so
+        # they need to be re-placed whenever the main window moves (e.g.
+        # the user drags the title bar or the window goes full-screen).
+        super().moveEvent(event)
+        self._reposition_visible_overlays()
+
+    def _reposition_visible_overlays(self) -> None:
+        """Re-run each overlay's positioning function if that overlay is
+        currently visible. Used by resizeEvent and moveEvent to keep the
+        top-level overlay windows pinned to their place over the main
+        window as it resizes or moves."""
         if getattr(self, "close_button", None) is not None \
                 and self.close_button.isVisible():
             self._position_close_button()
+        if getattr(self, "set_thumb_button", None) is not None \
+                and self.set_thumb_button.isVisible():
+            self._position_set_thumb_button()
         if getattr(self, "jog_bar", None) is not None \
                 and self.jog_bar.isVisible():
             self._position_jog_bar()
+        if getattr(self, "overlay_toggle", None) is not None \
+                and self.overlay_toggle.isVisible():
+            self._position_overlay_toggle()
 
     # ------------------------------------------------------------------ misc --
+    def _toggle_fullscreen(self, checked: bool | None = None) -> None:
+        """Toggle the main window between full-screen and normal.
+
+        Note: this toggles the OS-level full-screen state of the *main
+        window* (i.e. the frame / menu bar / title bar are hidden) and
+        is independent of the in-app "play this video fullscreen inside
+        the grid window" behavior.
+        """
+        if self.isFullScreen():
+            # Return to whichever pre-fullscreen state we had. showNormal()
+            # handles both maximized and ordinary windows correctly on all
+            # three platforms.
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        # Keep the menu check in sync with the actual window state.
+        if getattr(self, "fullscreen_act", None) is not None:
+            self.fullscreen_act.setChecked(self.isFullScreen())
+
+    def showEvent(self, event):
+        # The main window's HWND exists by the time showEvent fires, so
+        # this is the first safe moment to ask DWM to paint the 1px
+        # accent border black. Re-applied on state changes below because
+        # Windows may repaint/reset attributes when the window enters
+        # or leaves fullscreen.
+        super().showEvent(event)
+        self._paint_main_window_border_black()
+
+    def changeEvent(self, event):
+        # The user can leave fullscreen via the OS (e.g. Esc on some
+        # desktops, window manager shortcut, Mission Control, etc.). Keep
+        # our menu toggle honest by mirroring the real window state, and
+        # nudge the top-level overlay windows to re-pin themselves over
+        # the (possibly just-resized) main window.
+        if event.type() == QEvent.Type.WindowStateChange:
+            if getattr(self, "fullscreen_act", None) is not None:
+                self.fullscreen_act.setChecked(self.isFullScreen())
+            # Defer the reposition by one event-loop tick so the main
+            # window's geometry has settled into its new state, and
+            # re-assert the black DWM border in case Windows reset it
+            # when transitioning into/out of fullscreen.
+            QTimer.singleShot(0, self._reposition_visible_overlays)
+            QTimer.singleShot(0, self._paint_main_window_border_black)
+        super().changeEvent(event)
+
     def _show_about(self) -> None:
         QMessageBox.information(
             self, "About Video Grid Player",
             "Video Grid Player\n\n"
-            "Displays up to 12 videos in a 4 × 3 grid with thumbnails. "
-            "Click a cell to play the video fullscreen inside the app.\n\n"
+            "Displays your videos in a configurable grid (up to 6×6) with "
+            "thumbnails. Click a cell to play the video fullscreen inside "
+            "the app.\n\n"
             "Controls while playing:\n"
-            "  • Esc           return to grid (or click the ✕ button)\n"
-            "  • Space         pause / resume\n"
-            "  • ← / →         skip 5 seconds back / forward\n"
-            "  • Click / drag  on the bottom timeline to scrub\n\n"
+            "  • Esc            return to grid (or click the ✕ button)\n"
+            "  • Space          pause / resume\n"
+            "  • ← / →          skip 5 seconds back / forward\n"
+            "  • Click / drag   on the bottom timeline to scrub\n"
+            "  • Set Thumbnail  capture the current frame as this "
+            "video's grid thumbnail\n\n"
             "Built with Python, PyQt6, python-vlc, and OpenCV.")
 
     def closeEvent(self, event):
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
+        # Use the safe stop path that detaches the render HWND first,
+        # then release the player / instance. Without the HWND detach,
+        # VLC can hang on app-exit with the d3d11 vout bug.
+        self._stop_vlc_player()
         try:
-            self.player.stop()
             self.player.release()
             self.vlc_instance.release()
         except Exception:
