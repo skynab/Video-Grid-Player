@@ -31,6 +31,19 @@ uncluttered. The popup also lets you:
                                       (default)
       - Ultra    (1080p, 1920x1080) - best on 4K / high-DPI monitors;
                                       heaviest memory / decode cost
+  * Choose whether the chevron (▾) button also hides the floating
+    close (✕) button when it collapses the on-screen controls. Off
+    by default would keep ✕ visible at all times so playback can
+    always be exited with one click.
+
+All choices in the popup (grid size, full-width layout, thumbnail
+resolution, sidecar images, auto-hide, shuffle, chevron behavior,
+etc.) are saved automatically whenever you click "Choose Folder…",
+and restored the next time the app starts. The store lives at:
+
+  - Windows : HKCU\Software\VideoGridPlayer\VideoGridPlayer (registry)
+  - macOS   : ~/Library/Preferences/com.VideoGridPlayer.VideoGridPlayer.plist
+  - Linux   : ~/.config/VideoGridPlayer/VideoGridPlayer.conf
 
 
 THUMBNAILS
