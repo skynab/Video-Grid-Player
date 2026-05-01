@@ -47,7 +47,7 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 _missing: list[str] = []
 try:
     from PyQt6.QtCore import (
-        Qt, QEvent, QPoint, QRectF, QTimer, QThread, pyqtSignal,
+        Qt, QEvent, QPoint, QRectF, QSettings, QTimer, QThread, pyqtSignal,
     )
     from PyQt6.QtGui import (
         QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath,
@@ -503,13 +503,29 @@ class ThumbnailLabel(QLabel):
         aspect = (Qt.AspectRatioMode.IgnoreAspectRatio
                   if self._fit_mode == FIT_STRETCH
                   else Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        # Scale the source pixmap to the cell's *physical* pixel size,
+        # not its logical size. On a 150% / 200% Windows display (or any
+        # high-DPI monitor) self.size() reports logical pixels, so doing
+        # a scale-to-self.size() leaves the pixmap under-resolved and Qt
+        # has to upscale it again at paint time — that's the blur the
+        # user sees as "low-resolution thumbnails on Windows". Setting
+        # the scaled pixmap's devicePixelRatio tells the painter the
+        # bitmap is already physical-sized so it paints 1:1.
+        dpr = self.devicePixelRatioF() or 1.0
+        target_w = max(1, int(self.width() * dpr))
+        target_h = max(1, int(self.height() * dpr))
         scaled = self._src_pixmap.scaled(
-            self.size(),
+            target_w, target_h,
             aspect,
             Qt.TransformationMode.SmoothTransformation,
         )
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
+        scaled.setDevicePixelRatio(dpr)
+        # scaled.size() is in physical pixels; convert back to logical
+        # so the centering math matches the logical widget size.
+        logical_w = scaled.width() / dpr
+        logical_h = scaled.height() / dpr
+        x = int((self.width() - logical_w) / 2)
+        y = int((self.height() - logical_h) / 2)
         painter.drawPixmap(x, y, scaled)
 
 
@@ -548,10 +564,13 @@ class OpenFolderDialog(QDialog):
                  show_set_thumb_default: bool = True,
                  auto_hide_default: bool = False,
                  shuffle_default: bool = False,
-                 thumbnail_resolution_default: str = DEFAULT_THUMB_RES):
+                 thumbnail_resolution_default: str = DEFAULT_THUMB_RES,
+                 chevron_hides_close_default: bool = True,
+                 last_folder_default: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Open Videos")
-        self.setFixedSize(560, 535)
+        self.setFixedSize(560, 565)
+        self._last_folder_default: str = last_folder_default or ""
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -564,6 +583,7 @@ class OpenFolderDialog(QDialog):
         self.auto_hide_overlays: bool = auto_hide_default
         self.shuffle_play: bool = shuffle_default
         self.thumbnail_resolution: str = thumbnail_resolution_default
+        self.chevron_hides_close_button: bool = chevron_hides_close_default
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 16)
@@ -748,6 +768,18 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
+        self.chevron_hides_close_checkbox = QCheckBox(
+            "Chevron button also hides the close (✕) button")
+        self.chevron_hides_close_checkbox.setChecked(
+            chevron_hides_close_default)
+        self.chevron_hides_close_checkbox.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.chevron_hides_close_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.chevron_hides_close_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
         self.shuffle_checkbox = QCheckBox(
             "Shuffle \u2014 play a random video when the current one ends")
         self.shuffle_checkbox.setChecked(shuffle_default)
@@ -773,6 +805,31 @@ class OpenFolderDialog(QDialog):
         choose.clicked.connect(self._choose_folder)
         row.addWidget(choose)
 
+        # Reopens the most recently used folder without invoking the file
+        # picker. Disabled when no previous folder has been recorded yet
+        # or when the saved folder no longer exists on disk.
+        self.reopen_button = QPushButton("Open Last Folder")
+        self.reopen_button.setStyleSheet(
+            "QPushButton { background: #444444; color: white; "
+            "              padding: 9px 20px; border: none; "
+            "              border-radius: 4px; }"
+            "QPushButton:hover  { background: #555555; }"
+            "QPushButton:pressed{ background: #333333; }"
+            "QPushButton:disabled { background: #2a2a2a; color: #666666; }"
+        )
+        last_ok = bool(self._last_folder_default) and os.path.isdir(
+            self._last_folder_default)
+        self.reopen_button.setEnabled(last_ok)
+        if last_ok:
+            self.reopen_button.setToolTip(
+                "Reopen " + self._last_folder_default)
+        else:
+            self.reopen_button.setToolTip(
+                "No previous folder is available yet — "
+                "use “Choose Folder…” first.")
+        self.reopen_button.clicked.connect(self._reopen_last_folder)
+        row.addWidget(self.reopen_button)
+
         cancel = QPushButton("Cancel")
         cancel.setStyleSheet(
             "QPushButton { background: #333333; color: white; "
@@ -785,27 +842,56 @@ class OpenFolderDialog(QDialog):
         row.addStretch(1)
         root.addLayout(row)
 
+    def _commit_widget_values(self) -> None:
+        """Pull the current state of every option widget into this
+        dialog's public attributes. Shared by the Choose Folder and
+        Open Last Folder paths so both honor any tweaks the user made
+        in the popup before clicking."""
+        self.show_titles = self.titles_checkbox.isChecked()
+        self.grid_rows = self.rows_spin.value()
+        self.grid_cols = self.cols_spin.value()
+        self.full_width = self.full_width_checkbox.isChecked()
+        self.use_sidecar = self.sidecar_checkbox.isChecked()
+        self.thumbnail_fit = (
+            FIT_CLIP if self.clip_thumb_checkbox.isChecked()
+            else FIT_STRETCH)
+        self.show_set_thumb_button = (
+            self.set_thumb_button_checkbox.isChecked())
+        self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
+        self.chevron_hides_close_button = (
+            self.chevron_hides_close_checkbox.isChecked())
+        self.shuffle_play = self.shuffle_checkbox.isChecked()
+        res_key = self.res_combo.currentData()
+        if res_key in THUMB_RESOLUTIONS:
+            self.thumbnail_resolution = res_key
+
     def _choose_folder(self) -> None:
+        # Default the OS picker to the last folder we used, if it still
+        # exists; otherwise fall back to the user's home directory.
+        start_dir = (self._last_folder_default
+                     if self._last_folder_default
+                     and os.path.isdir(self._last_folder_default)
+                     else os.path.expanduser("~"))
         folder = QFileDialog.getExistingDirectory(
-            self, "Select a folder of videos", os.path.expanduser("~"))
+            self, "Select a folder of videos", start_dir)
         if folder:
             self.chosen_folder = folder
-            self.show_titles = self.titles_checkbox.isChecked()
-            self.grid_rows = self.rows_spin.value()
-            self.grid_cols = self.cols_spin.value()
-            self.full_width = self.full_width_checkbox.isChecked()
-            self.use_sidecar = self.sidecar_checkbox.isChecked()
-            self.thumbnail_fit = (
-                FIT_CLIP if self.clip_thumb_checkbox.isChecked()
-                else FIT_STRETCH)
-            self.show_set_thumb_button = (
-                self.set_thumb_button_checkbox.isChecked())
-            self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
-            self.shuffle_play = self.shuffle_checkbox.isChecked()
-            res_key = self.res_combo.currentData()
-            if res_key in THUMB_RESOLUTIONS:
-                self.thumbnail_resolution = res_key
+            self._commit_widget_values()
             self.accept()
+
+    def _reopen_last_folder(self) -> None:
+        """Skip the file picker and reuse the previously selected folder.
+        Refuses (and disables itself) if the path is missing — that can
+        happen if the folder was renamed/moved between sessions."""
+        target = self._last_folder_default
+        if not target or not os.path.isdir(target):
+            self.reopen_button.setEnabled(False)
+            self.reopen_button.setToolTip(
+                "Previous folder is no longer available.")
+            return
+        self.chosen_folder = target
+        self._commit_widget_values()
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +956,8 @@ class VideoGridApp(QMainWindow):
         self._overlays_hidden: bool = False       # current hide/show state
         self.shuffle_play: bool = False           # play random next on end
         self.thumbnail_resolution: str = DEFAULT_THUMB_RES  # decoded thumb size
+        self.chevron_hides_close_button: bool = True  # ✕ vanishes on collapse?
+        self.last_folder: str = ""  # most recent folder loaded; "" if none yet
         # Remembered window state across a play→stop cycle. Populated in
         # _play_video_at so we can restore the pre-playback window state
         # (fullscreen / maximized / normal) when playback ends.
@@ -877,6 +965,10 @@ class VideoGridApp(QMainWindow):
         self._was_maximized_before_play: bool = False
         self.current_video_path: str | None = None
         self.current_video_idx: int | None = None
+
+        # Load any preferences saved on a previous run, so the open-folder
+        # popup comes up pre-filled with the user's last-used choices.
+        self._load_preferences()
 
         # Central pages (grid / video) in a stack
         self.stack = QStackedWidget()
@@ -1419,13 +1511,17 @@ class VideoGridApp(QMainWindow):
             self._hide_overlays()
 
     def _hide_overlays(self) -> None:
-        """Hide the timeline, pause, close, and Set Thumbnail buttons.
-        The chevron toggle stays visible so the user can bring them back."""
+        """Hide the timeline, pause, and Set Thumbnail buttons. Whether
+        the close (✕) button is also hidden depends on the
+        ``chevron_hides_close_button`` option chosen in the open-folder
+        popup. The chevron toggle itself always stays visible so the
+        user can bring everything back."""
         if not self.is_playing:
             return
         self._overlays_hidden = True
         self.jog_bar.hide()
-        self.close_button.hide()
+        if self.chevron_hides_close_button:
+            self.close_button.hide()
         self.set_thumb_button.hide()
         self.overlay_toggle.setText("\u25B4")       # ▴
         self.overlay_toggle.setToolTip("Show on-screen controls")
@@ -1518,6 +1614,103 @@ class VideoGridApp(QMainWindow):
         except Exception:
             pass
 
+    # ----------------------------------------------------- preferences I/O --
+    _PREF_KEYS: tuple[tuple[str, type, object], ...] = (
+        # (attribute_name, value_type, fallback_default)
+        ("show_titles", bool, True),
+        ("grid_rows", int, DEFAULT_GRID_ROWS),
+        ("grid_cols", int, DEFAULT_GRID_COLS),
+        ("full_width", bool, True),
+        ("use_sidecar_thumbnails", bool, False),
+        ("thumbnail_fit", str, FIT_STRETCH),
+        ("show_set_thumb_button", bool, True),
+        ("auto_hide_overlays", bool, False),
+        ("shuffle_play", bool, False),
+        ("thumbnail_resolution", str, DEFAULT_THUMB_RES),
+        ("chevron_hides_close_button", bool, True),
+        ("last_folder", str, ""),
+    )
+
+    def _settings(self) -> "QSettings":
+        """QSettings handle bound to the per-user store. Org/app names
+        are set in main() so this is the same store across sessions."""
+        return QSettings()
+
+    @staticmethod
+    def _coerce(value, value_type, fallback):
+        """QSettings on some platforms (notably the INI backend) returns
+        every value as a string. Coerce booleans / ints / strings back
+        into their declared type, falling back if the conversion fails."""
+        if value is None:
+            return fallback
+        if value_type is bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            try:
+                return bool(int(value))
+            except (TypeError, ValueError):
+                return fallback
+        if value_type is int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+        if value_type is str:
+            try:
+                return str(value)
+            except Exception:
+                return fallback
+        return value
+
+    def _load_preferences(self) -> None:
+        """Read each persisted preference from QSettings into the
+        matching MainWindow attribute. Silently uses the in-code default
+        if the key is missing or the stored value is unreadable, so the
+        first launch (or a corrupted store) still works."""
+        try:
+            settings = self._settings()
+        except Exception as exc:
+            print(f"[prefs] could not open settings: {exc}")
+            return
+        for attr, vtype, fallback in self._PREF_KEYS:
+            current = getattr(self, attr, fallback)
+            try:
+                raw = settings.value(attr, current)
+            except Exception:
+                raw = current
+            value = self._coerce(raw, vtype, current)
+            # Sanity check for the resolution key — fall back if a stale
+            # store has a name we no longer support.
+            if attr == "thumbnail_resolution" and value not in THUMB_RESOLUTIONS:
+                value = DEFAULT_THUMB_RES
+            if attr == "thumbnail_fit" and value not in (FIT_STRETCH, FIT_CLIP):
+                value = FIT_STRETCH
+            if attr in ("grid_rows", "grid_cols"):
+                value = max(1, min(MAX_GRID_DIM, int(value)))
+            setattr(self, attr, value)
+
+    def _save_preferences(self) -> None:
+        """Persist every tracked preference back to QSettings. Called
+        whenever the open-folder dialog is accepted, and one last time
+        on app close so an unexpectedly-quit session still writes its
+        last state."""
+        try:
+            settings = self._settings()
+        except Exception as exc:
+            print(f"[prefs] could not open settings: {exc}")
+            return
+        for attr, _vtype, _fallback in self._PREF_KEYS:
+            try:
+                settings.setValue(attr, getattr(self, attr))
+            except Exception as exc:
+                print(f"[prefs] could not save {attr}: {exc}")
+        try:
+            settings.sync()
+        except Exception:
+            pass
+
     # ------------------------------------------------------- folder loading --
     def _show_open_dialog(self) -> None:
         dlg = OpenFolderDialog(
@@ -1532,6 +1725,8 @@ class VideoGridApp(QMainWindow):
             auto_hide_default=self.auto_hide_overlays,
             shuffle_default=self.shuffle_play,
             thumbnail_resolution_default=self.thumbnail_resolution,
+            chevron_hides_close_default=self.chevron_hides_close_button,
+            last_folder_default=self.last_folder,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -1544,6 +1739,9 @@ class VideoGridApp(QMainWindow):
             self.auto_hide_overlays = dlg.auto_hide_overlays
             self.shuffle_play = dlg.shuffle_play
             self.thumbnail_resolution = dlg.thumbnail_resolution
+            self.chevron_hides_close_button = dlg.chevron_hides_close_button
+            # Persist these choices so the next run remembers them.
+            self._save_preferences()
             self._load_folder(dlg.chosen_folder)
 
     def _load_folder(self, folder: str) -> None:
@@ -1570,6 +1768,14 @@ class VideoGridApp(QMainWindow):
         self.video_files = videos[:self.grid_rows * self.grid_cols]
         self.thumbnails.clear()
         self._render_grid()
+
+        # Remember this folder so the next run's "Open Last Folder"
+        # button can jump straight back to it.
+        try:
+            self.last_folder = os.path.abspath(folder)
+            self._save_preferences()
+        except Exception as exc:
+            print(f"[prefs] could not save last_folder: {exc}")
 
         # Swap in a new thumbnail worker (stops any previous one first)
         if self.thumb_worker is not None:
@@ -2253,6 +2459,13 @@ class VideoGridApp(QMainWindow):
             "Built with Python, PyQt6, python-vlc, and OpenCV.")
 
     def closeEvent(self, event):
+        # Final save on quit catches any state that changed without the
+        # open-folder dialog being touched (defensive — most settings
+        # changes already round-trip through that dialog).
+        try:
+            self._save_preferences()
+        except Exception:
+            pass
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
@@ -2272,7 +2485,24 @@ class VideoGridApp(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # Use the OS's exact DPI scale factor (e.g. 1.25, 1.5) instead of
+    # rounding it to the nearest integer. Without this, on Windows
+    # displays scaled to 125% / 150% the QPaintDevice's
+    # devicePixelRatio reads as 1.0 even though the OS is asking for
+    # 1.5 — which leaves bitmaps (like our thumbnails) under-resolved
+    # and visibly soft. Must be set before QApplication is constructed.
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+    # Set application identity so QSettings picks a stable per-user
+    # storage location (registry on Windows, plist on macOS, INI under
+    # ~/.config on Linux). Required for the saved-preferences feature.
+    app.setOrganizationName("VideoGridPlayer")
+    app.setApplicationName("VideoGridPlayer")
     initial = sys.argv[1] if len(sys.argv) > 1 else None
     window = VideoGridApp(initial_folder=initial)
     window.show()
