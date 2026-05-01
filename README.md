@@ -36,10 +36,18 @@ uncluttered. The popup also lets you:
     by default would keep ✕ visible at all times so playback can
     always be exited with one click.
 
+The popup also has an "Open Last Folder" button alongside "Choose
+Folder…". It reuses the most recently loaded folder without going
+through the OS file picker, which is handy when you keep opening
+the same library. The button is disabled if you've never loaded a
+folder before, or if the previously loaded folder no longer exists
+on disk.
+
 All choices in the popup (grid size, full-width layout, thumbnail
 resolution, sidecar images, auto-hide, shuffle, chevron behavior,
-etc.) are saved automatically whenever you click "Choose Folder…",
-and restored the next time the app starts. The store lives at:
+last folder, etc.) are saved automatically whenever you click
+"Choose Folder…" or "Open Last Folder", and restored the next time
+the app starts. The store lives at:
 
   - Windows : HKCU\Software\VideoGridPlayer\VideoGridPlayer (registry)
   - macOS   : ~/Library/Preferences/com.VideoGridPlayer.VideoGridPlayer.plist
