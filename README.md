@@ -1,6 +1,6 @@
 # Video Grid Player
 
-A cross-platform desktop app (Windows / macOS / Linux) that shows your videos in a configurable grid (up to 6 rows × 6 columns, default 3×4) with real thumbnail previews extracted from each video. Each cell can show the file name (extension hidden) as a title. Clicking a cell plays the video **fullscreen inside the same application** — no external player is launched. A floating circular ✕ button and a bottom scrubber/timeline are overlaid on the video while playing. When playback finishes, or `Esc` is pressed, or the ✕ is clicked, the app returns to the grid view.
+A cross-platform desktop app (Windows / macOS / Linux?) that shows your videos in a configurable grid (up to 6 rows × 6 columns, default 3×4) with real thumbnail previews extracted from each video. Each cell can show the file name (extension hidden) as a title. Clicking a cell plays the video **fullscreen inside the same application** — no external player is launched. A floating circular ✕ button and a bottom scrubber/timeline are overlaid on the video while playing. When playback finishes, or `Esc` is pressed, or the ✕ is clicked, the app returns to the grid view.
 
 The folder picker opens in a clean modal popup — either automatically on startup, or from **File → Open Folder…** — so the main window stays uncluttered. The popup also lets you:
 
