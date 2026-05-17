@@ -1,0 +1,65 @@
+name: tests
+
+# Runs on every pull request and on pushes to main. Keep the matrix
+# narrow so the queue stays snappy — coverage of three OSes on one
+# stable Python version is enough to catch the platform-specific
+# regressions this app actually has (path handling on Windows, etc.).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # PyQt6 needs a handful of X libs to import on a headless Linux
+      # runner even with QT_QPA_PLATFORM=offscreen. macOS and Windows
+      # ship everything we need out of the box.
+      - name: Install Qt system dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libglib2.0-0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libdbus-1-3
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # opencv-python-headless avoids pulling in a real GUI backend on
+          # the runner; python-vlc itself is mocked in the test suite so
+          # we don't need libvlc on the system.
+          pip install PyQt6 opencv-python-headless numpy pytest
+
+      - name: Byte-compile check
+        run: python -m py_compile video_grid.py
+
+      - name: Run pytest
+        env:
+          # Headless Qt platform plugin — required so PyQt6 can be
+          # imported without a display server on Linux.
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -v tests

@@ -68,6 +68,17 @@ python video_grid.py                      # launches with the popup picker
 python video_grid.py "/path/to/videos"    # preload a folder, skip popup
 ```
 
+## Tests
+
+A small pytest suite under `tests/` exercises the pure helpers (thumbnail resolution lookup, time formatting, QSettings type coercion, cache path derivation, sidecar discovery). The same suite runs in CI on Ubuntu, macOS, and Windows via `.github/workflows/tests.yml` on every pull request.
+
+To run the tests locally:
+
+```sh
+pip install PyQt6 opencv-python-headless numpy pytest
+QT_QPA_PLATFORM=offscreen pytest -v tests
+```
+
 Or use **File → Open Folder…** from inside the app at any time.
 
 The app scans the chosen folder for the following extensions and loads the first *N* files (alphabetical), where *N* is `rows × columns`:
