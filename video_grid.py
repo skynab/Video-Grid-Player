@@ -47,11 +47,12 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 _missing: list[str] = []
 try:
     from PyQt6.QtCore import (
-        Qt, QEvent, QPoint, QRectF, QSettings, QTimer, QThread, pyqtSignal,
+        Qt, QEvent, QPoint, QRectF, QSettings, QSize, QTimer, QThread,
+        pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QAction, QColor, QImage, QKeySequence, QPainter, QPainterPath,
-        QPalette, QPixmap, QRegion,
+        QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPainterPath,
+        QPalette, QPen, QPixmap, QRegion,
     )
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
@@ -454,6 +455,127 @@ def apply_rounded_mask(widget, radius: int) -> None:
     path.addRoundedRect(QRectF(0, 0, widget.width(), widget.height()),
                         radius, radius)
     widget.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+def _make_loop_icon(size: int = 26) -> "QIcon":
+    """White 'replay / loop' icon: a circle-arrow with a play triangle inside."""
+    import math
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    color = QColor("white")
+    lw = max(2, round(size * 0.10))
+    pen = QPen(color, lw, Qt.PenStyle.SolidLine,
+               Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    cx, cy = size / 2, size / 2
+    r = size * 0.38
+
+    # Arc: ~300° starting from top-right, leaving a gap at the top for arrow
+    start_deg = 80        # gap starts here (degrees, Qt: 0=3-o'clock, CCW)
+    span_deg  = -300      # sweep clockwise
+    rect = QRectF(cx - r, cy - r, r * 2, r * 2)
+    p.drawArc(rect,
+              round(start_deg * 16),
+              round(span_deg  * 16))
+
+    # Arrowhead at the end of the arc (near the gap)
+    end_rad = math.radians(start_deg + span_deg)  # in standard math coords
+    # tip of the arrow on the circle
+    tip_x = cx + r * math.cos(math.radians(start_deg + span_deg))
+    tip_y = cy - r * math.sin(math.radians(start_deg + span_deg))
+    # tangent direction (perpendicular to radius at tip), rotated for arrowhead
+    tangent_angle = math.radians(start_deg + span_deg) + math.pi / 2
+    arr = size * 0.20
+    a1x = tip_x + arr * math.cos(tangent_angle + 0.55)
+    a1y = tip_y - arr * math.sin(tangent_angle + 0.55)
+    a2x = tip_x + arr * math.cos(tangent_angle - 0.55)
+    a2y = tip_y - arr * math.sin(tangent_angle - 0.55)
+    path = QPainterPath()
+    path.moveTo(a1x, a1y)
+    path.lineTo(tip_x, tip_y)
+    path.lineTo(a2x, a2y)
+    p.drawPath(path)
+
+    # Play triangle in the centre
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    tri_r = size * 0.18
+    tri_cx = cx + size * 0.03   # nudge right so it looks centred optically
+    tri_cy = cy
+    tri = QPainterPath()
+    tri.moveTo(tri_cx - tri_r * 0.6, tri_cy - tri_r)
+    tri.lineTo(tri_cx + tri_r,       tri_cy)
+    tri.lineTo(tri_cx - tri_r * 0.6, tri_cy + tri_r)
+    tri.closeSubpath()
+    p.drawPath(tri)
+
+    p.end()
+    return QIcon(px)
+
+
+def _make_checkmark_icon(size: int = 26) -> "QIcon":
+    """White checkmark icon for the 'thumbnail set' confirmation state."""
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    lw = max(2, round(size * 0.12))
+    pen = QPen(QColor("white"), lw, Qt.PenStyle.SolidLine,
+               Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    s = size
+    p.drawLine(round(s * 0.18), round(s * 0.52),
+               round(s * 0.42), round(s * 0.76))
+    p.drawLine(round(s * 0.42), round(s * 0.76),
+               round(s * 0.82), round(s * 0.26))
+    p.end()
+    return QIcon(px)
+
+
+def _make_camera_icon(size: int = 40) -> "QIcon":
+    """Draw a simple white camera icon at *size* × *size* px."""
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    color = QColor("white")
+    s = size
+    lw = max(2, round(s * 0.07))
+    pen = QPen(color, lw, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+               Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    # --- camera body ---------------------------------------------------
+    pad    = round(s * 0.10)
+    body_x = pad
+    body_y = round(s * 0.30)
+    body_w = s - 2 * pad
+    body_h = round(s * 0.48)
+    body_r = round(s * 0.12)
+    p.drawRoundedRect(QRectF(body_x, body_y, body_w, body_h), body_r, body_r)
+
+    # --- viewfinder bump on top ----------------------------------------
+    bump_w = round(s * 0.28)
+    bump_h = round(s * 0.12)
+    bump_x = round(s * 0.5 - bump_w / 2)
+    bump_y = body_y - bump_h + lw // 2
+    p.drawRoundedRect(QRectF(bump_x, bump_y, bump_w, bump_h),
+                      round(bump_h * 0.4), round(bump_h * 0.4))
+
+    # --- lens (circle) -------------------------------------------------
+    lens_r = round(s * 0.15)
+    cx_l   = round(s * 0.5)
+    cy_l   = round(body_y + body_h / 2)
+    p.drawEllipse(QRectF(cx_l - lens_r, cy_l - lens_r, lens_r * 2, lens_r * 2))
+
+    p.end()
+    return QIcon(px)
 
 
 class ThumbnailLabel(QLabel):
@@ -978,6 +1100,7 @@ class VideoGridApp(QMainWindow):
         self._build_video_page()
         self._build_close_overlay()
         self._build_set_thumb_overlay()
+        self._build_loop_overlay()
         self._build_jog_overlay()
         self._build_overlay_toggle()
         self._build_auto_hide_timer()
@@ -1268,9 +1391,11 @@ class VideoGridApp(QMainWindow):
         captures the current frame and uses it as the grid thumbnail for
         the video being played. It sits just to the left of the ✕ button.
         """
-        self.set_thumb_button = QPushButton("\u25A3  Set Thumbnail", self)
+        self.set_thumb_button = QPushButton(self)
         self.set_thumb_button.setObjectName("setThumbOverlay")
-        self.set_thumb_button.setFixedHeight(40)
+        self.set_thumb_button.setFixedSize(40, 40)
+        self.set_thumb_button.setIcon(_make_camera_icon(26))
+        self.set_thumb_button.setIconSize(QSize(26, 26))
         self.set_thumb_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.set_thumb_button.setToolTip(
             "Use the current frame as this video's grid thumbnail")
@@ -1279,12 +1404,9 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.setStyleSheet(
             "#setThumbOverlay {"
             "  background-color: rgba(0, 0, 0, 170);"
-            "  color: white;"
             "  border: none;"
             "  border-radius: 20px;"
-            "  font-size: 13px;"
-            "  font-weight: bold;"
-            "  padding: 0 18px;"
+            "  padding: 0;"
             "}"
             "#setThumbOverlay:hover {"
             "  background-color: rgba(43, 95, 161, 220);"
@@ -1301,9 +1423,6 @@ class VideoGridApp(QMainWindow):
         """Pin the 'Set Thumbnail' button just to the left of the ✕ button."""
         margin = 20
         gap = 12
-        self.set_thumb_button.adjustSize()
-        # adjustSize() respects text width but we forced a fixed height earlier.
-        self.set_thumb_button.setFixedHeight(40)
         # Compute the close button's position in OUR local coord space
         # (close_button is a top-level window, so its .x()/.y() are global).
         close_local = self.mapFromGlobal(
@@ -1311,11 +1430,82 @@ class VideoGridApp(QMainWindow):
         x = close_local.x() - self.set_thumb_button.width() - gap
         y = margin + (self.close_button.height() - 40) // 2
         self._place_overlay(self.set_thumb_button, x, y)
-        # Re-apply the pill mask every time the width changes (the button
-        # is resized by adjustSize() when the text changes between ▣ Set
-        # Thumbnail and ✓ Thumbnail Set).
         apply_rounded_mask(self.set_thumb_button, 20)
         self.set_thumb_button.raise_()
+
+    # --------------------------------------------------- loop/replay button --
+    def _build_loop_overlay(self) -> None:
+        """Floating loop button in the top-left corner of the video.
+        When active the video restarts automatically when it ends."""
+        self.loop_active: bool = False
+        self.loop_button = QPushButton(self)
+        self.loop_button.setObjectName("loopOverlay")
+        self.loop_button.setFixedSize(40, 40)
+        self.loop_button.setIcon(_make_loop_icon(24))
+        self.loop_button.setIconSize(QSize(24, 24))
+        self.loop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.loop_button.setToolTip("Loop: off  —  click to enable")
+        self.loop_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._promote_to_overlay_window(self.loop_button)
+        self._apply_loop_button_style()
+        self.loop_button.clicked.connect(self._toggle_loop)
+        apply_rounded_mask(self.loop_button, 20)
+        self.loop_button.hide()
+
+    def _apply_loop_button_style(self) -> None:
+        if self.loop_active:
+            self.loop_button.setStyleSheet(
+                "#loopOverlay {"
+                "  background-color: rgba(43, 95, 161, 210);"
+                "  border: none;"
+                "  border-radius: 20px;"
+                "  padding: 0;"
+                "}"
+                "#loopOverlay:hover {"
+                "  background-color: rgba(59, 126, 201, 230);"
+                "}"
+                "#loopOverlay:pressed {"
+                "  background-color: rgba(36, 82, 139, 240);"
+                "}"
+            )
+        else:
+            self.loop_button.setStyleSheet(
+                "#loopOverlay {"
+                "  background-color: rgba(0, 0, 0, 170);"
+                "  border: none;"
+                "  border-radius: 20px;"
+                "  padding: 0;"
+                "}"
+                "#loopOverlay:hover {"
+                "  background-color: rgba(43, 95, 161, 220);"
+                "}"
+                "#loopOverlay:pressed {"
+                "  background-color: rgba(36, 82, 139, 230);"
+                "}"
+            )
+
+    def _toggle_loop(self) -> None:
+        self.loop_active = not self.loop_active
+        self._apply_loop_button_style()
+        state = "on" if self.loop_active else "off"
+        self.loop_button.setToolTip(f"Loop: {state}  —  click to toggle")
+
+    def _position_loop_button(self) -> None:
+        """Pin the loop button just to the left of the camera button (or the
+        ✕ button if the camera button is hidden)."""
+        gap = 12
+        margin = 20
+        if self.set_thumb_button.isVisible():
+            anchor = self.mapFromGlobal(
+                QPoint(self.set_thumb_button.x(), self.set_thumb_button.y()))
+        else:
+            anchor = self.mapFromGlobal(
+                QPoint(self.close_button.x(), self.close_button.y()))
+        x = anchor.x() - self.loop_button.width() - gap
+        y = margin + (self.close_button.height() - 40) // 2
+        self._place_overlay(self.loop_button, x, y)
+        apply_rounded_mask(self.loop_button, 20)
+        self.loop_button.raise_()
 
     # ------------------------------------------------ jog / transport bar --
     def _build_jog_overlay(self) -> None:
@@ -1523,6 +1713,7 @@ class VideoGridApp(QMainWindow):
         if self.chevron_hides_close_button:
             self.close_button.hide()
         self.set_thumb_button.hide()
+        self.loop_button.hide()
         self.overlay_toggle.setText("\u25B4")       # ▴
         self.overlay_toggle.setToolTip("Show on-screen controls")
         # Chevron is now on its own at the bottom — reposition accordingly.
@@ -1540,6 +1731,9 @@ class VideoGridApp(QMainWindow):
             self._position_set_thumb_button()
             self.set_thumb_button.show()
             self.set_thumb_button.raise_()
+        self._position_loop_button()
+        self.loop_button.show()
+        self.loop_button.raise_()
         self._position_jog_bar()
         self.jog_bar.show()
         self.jog_bar.raise_()
@@ -2059,12 +2253,16 @@ class VideoGridApp(QMainWindow):
         # the "✓ Thumbnail Set" confirmation from a previous play, then
         # show it to the left of the ✕ button — but only if the user has
         # the "Show Set Thumbnail button" option enabled in the popup.
-        self.set_thumb_button.setText("\u25A3  Set Thumbnail")
+        self.set_thumb_button.setIcon(_make_camera_icon(26))
         if self.show_set_thumb_button:
             self._position_set_thumb_button()
             self.set_thumb_button.show()
         else:
             self.set_thumb_button.hide()
+
+        # Show the loop button to the left of the camera button.
+        self._position_loop_button()
+        self.loop_button.show()
 
         # Reset and reveal the jog/transport bar
         self.timeline.blockSignals(True)
@@ -2202,10 +2400,10 @@ class VideoGridApp(QMainWindow):
             entry["thumb"].setText("")
 
         # Brief on-screen confirmation so the user knows it worked.
-        self.set_thumb_button.setText("\u2713  Thumbnail Set")
+        self.set_thumb_button.setIcon(_make_checkmark_icon(26))
         QTimer.singleShot(
             1400,
-            lambda: self.set_thumb_button.setText("\u25A3  Set Thumbnail"))
+            lambda: self.set_thumb_button.setIcon(_make_camera_icon(26)))
 
     def _toggle_pause(self) -> None:
         """Toggle VLC's paused state and refresh the button label."""
@@ -2252,9 +2450,15 @@ class VideoGridApp(QMainWindow):
 
     def _handle_video_ended(self) -> None:
         """Called on the GUI thread when the currently-playing video ends
-        (or errors out). If shuffle is enabled, pick a random next video
-        and continue playing. Otherwise return to the grid."""
-        if (self.shuffle_play
+        (or errors out). Loops the current video if loop mode is active,
+        shuffles to a new video if shuffle is enabled, otherwise returns
+        to the grid."""
+        if self.loop_active and self.is_playing and self.current_video_path:
+            path = self.current_video_path
+            media = self.vlc_instance.media_new(path)
+            self.player.set_media(media)
+            self.player.play()
+        elif (self.shuffle_play
                 and self.is_playing
                 and len(self.video_files) >= 1):
             self._play_next_shuffled()
@@ -2330,6 +2534,7 @@ class VideoGridApp(QMainWindow):
         self.auto_hide_timer.stop()
         self.close_button.hide()
         self.set_thumb_button.hide()
+        self.loop_button.hide()
         self.jog_bar.hide()
         self.overlay_toggle.hide()
         self._overlays_hidden = False
@@ -2389,6 +2594,9 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "set_thumb_button", None) is not None \
                 and self.set_thumb_button.isVisible():
             self._position_set_thumb_button()
+        if getattr(self, "loop_button", None) is not None \
+                and self.loop_button.isVisible():
+            self._position_loop_button()
         if getattr(self, "jog_bar", None) is not None \
                 and self.jog_bar.isVisible():
             self._position_jog_bar()
