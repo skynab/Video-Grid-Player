@@ -21,12 +21,18 @@ LANGUAGES: dict[str, str] = {
 TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
         # --- dialog chrome ---
+        "section_app":          "Video Grid Player",
+        "section_language":     "Language",
+        "section_grid":         "Video Grid",
+        "section_pages":        "Video Grid Pages",
+        "section_player":       "Player",
         "dialog_title":         "Open Videos",
         "app_title":            "Video Grid Player",
         "app_desc":             "Select a folder containing your video files.\nYour videos will be shown in the grid configured below.",
 
         # --- language row ---
         "language_label":       "Language:",
+        "translate_titles":    "Attempt to translate video titles into the selected language",
 
         # --- grid size ---
         "rows_label":           "Rows:",
@@ -47,6 +53,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Auto-hide on-screen controls after 5 seconds of playback",
         "chevron_hides_close":  "Chevron button also hides the close (✕) button",
         "shuffle":              "Shuffle — play a random video when the current one ends",
+        "multi_page":           "Multiple pages — show all videos across multiple grid pages",
+        "page_fill_label":     "When videos don't fill a page evenly:",
+        "page_fill_blank":     "Allow blank spaces",
+        "page_fill_round_up":  "Round up the number of pages",
+        "page_fill_wrap":      "Fill empty spaces with previously shown videos",
 
         # --- buttons ---
         "choose_folder":        "Choose Folder…",
@@ -81,12 +92,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "fr": {
         # --- dialog chrome ---
+        "section_app":          "Lecteur en grille",
+        "section_language":     "Langue",
+        "section_grid":         "Grille vidéo",
+        "section_pages":        "Pages de la grille",
+        "section_player":       "Lecteur",
         "dialog_title":         "Ouvrir des vidéos",
         "app_title":            "Lecteur en grille",
         "app_desc":             "Sélectionnez un dossier contenant vos fichiers vidéo.\nVos vidéos s’afficheront dans la grille configurée ci-dessous.",
 
         # --- language row ---
         "language_label":       "Langue :",
+        "translate_titles":    "Tenter de traduire les titres des vidéos dans la langue sélectionnée",
 
         # --- grid size ---
         "rows_label":           "Lignes :",
@@ -107,6 +124,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Masquer automatiquement les commandes après 5 secondes de lecture",
         "chevron_hides_close":  "Le bouton chevron masque aussi le bouton fermer (✕)",
         "shuffle":              "Aléatoire — lire une vidéo aléatoire à la fin de la vidéo en cours",
+        "multi_page":           "Pages multiples — afficher toutes les vidéos sur plusieurs pages",
+        "page_fill_label":     "Quand les vidéos ne remplissent pas une page entière :",
+        "page_fill_blank":     "Autoriser les espaces vides",
+        "page_fill_round_up":  "Arrondir le nombre de pages",
+        "page_fill_wrap":      "Remplir les espaces vides avec les vidéos précédemment affichées",
 
         # --- buttons ---
         "choose_folder":        "Choisir un dossier…",
@@ -141,12 +163,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "de": {
         # --- dialog chrome ---
+        "section_app":          "Video-Raster-Player",
+        "section_language":     "Sprache",
+        "section_grid":         "Videoraster",
+        "section_pages":        "Videoraster-Seiten",
+        "section_player":       "Wiedergabe",
         "dialog_title":         "Videos öffnen",
         "app_title":            "Video-Raster-Player",
         "app_desc":             "Wählen Sie einen Ordner mit Ihren Videodateien.\nIhre Videos werden im unten konfigurierten Raster angezeigt.",
 
         # --- language row ---
         "language_label":       "Sprache:",
+        "translate_titles":    "Versuchen, Videotitel in die ausgewählte Sprache zu übersetzen",
 
         # --- grid size ---
         "rows_label":           "Zeilen:",
@@ -167,6 +195,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Steuerung nach 5 Sekunden automatisch ausblenden",
         "chevron_hides_close":  "Chevron-Schaltfläche blendet auch die Schließen-Schaltfläche (✕) aus",
         "shuffle":              "Zufallswiedergabe — nach dem Ende ein zufälliges Video abspielen",
+        "multi_page":           "Mehrere Seiten — alle Videos auf mehreren Rasterseiten anzeigen",
+        "page_fill_label":     "Wenn Videos eine Seite nicht gleichmäßig füllen:",
+        "page_fill_blank":     "Leere Felder zulassen",
+        "page_fill_round_up":  "Anzahl der Seiten aufrunden",
+        "page_fill_wrap":      "Leere Felder mit zuvor angezeigten Videos füllen",
 
         # --- buttons ---
         "choose_folder":        "Ordner auswählen…",
@@ -201,12 +234,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "es": {
         # --- dialog chrome ---
+        "section_app":          "Reproductor en cuadrícula",
+        "section_language":     "Idioma",
+        "section_grid":         "Cuadrícula de vídeo",
+        "section_pages":        "Páginas de cuadrícula",
+        "section_player":       "Reproductor",
         "dialog_title":         "Abrir vídeos",
         "app_title":            "Reproductor en cuadrícula",
         "app_desc":             "Seleccione una carpeta con sus archivos de vídeo.\nSus vídeos se mostrarán en la cuadrícula configurada abajo.",
 
         # --- language row ---
         "language_label":       "Idioma:",
+        "translate_titles":    "Intentar traducir los títulos de vídeo al idioma seleccionado",
 
         # --- grid size ---
         "rows_label":           "Filas:",
@@ -227,6 +266,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Ocultar controles automáticamente después de 5 segundos de reproducción",
         "chevron_hides_close":  "El botón de cheurón también oculta el botón de cerrar (✕)",
         "shuffle":              "Aleatorio — reproducir un vídeo aleatorio al terminar el actual",
+        "multi_page":           "Varias páginas — mostrar todos los vídeos en varias páginas de cuadrícula",
+        "page_fill_label":     "Cuando los vídeos no llenan una página de manera uniforme:",
+        "page_fill_blank":     "Permitir espacios en blanco",
+        "page_fill_round_up":  "Redondear hacia arriba el número de páginas",
+        "page_fill_wrap":      "Rellenar espacios vacíos con vídeos mostrados anteriormente",
 
         # --- buttons ---
         "choose_folder":        "Elegir carpeta…",
@@ -261,12 +305,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "zh": {
         # --- dialog chrome ---
+        "section_app":          "视频网格播放器",
+        "section_language":     "语言",
+        "section_grid":         "视频网格",
+        "section_pages":        "视频网格页面",
+        "section_player":       "播放器",
         "dialog_title":         "打开视频",
         "app_title":            "视频网格播放器",
         "app_desc":             "选择包含视频文件的文件夹。\n您的视频将显示在下方配置的网格中。",
 
         # --- language row ---
         "language_label":       "语言：",
+        "translate_titles":    "尝试将视频标题翻译为所选语言",
 
         # --- grid size ---
         "rows_label":           "行数：",
@@ -287,6 +337,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "播放 5 秒后自动隐藏屏幕控件",
         "chevron_hides_close":  "折叠按钮同时隐藏关闭按钮（✕）",
         "shuffle":              "随机播放 — 当前视频结束后随机播放下一个",
+        "multi_page":           "多页显示 — 在多个网格页面中显示所有视频",
+        "page_fill_label":     "视频无法均匀填满页面时：",
+        "page_fill_blank":     "允许空白格",
+        "page_fill_round_up":  "向上取整页数",
+        "page_fill_wrap":      "用之前显示的视频填充空白格",
 
         # --- buttons ---
         "choose_folder":        "选择文件夹…",
@@ -321,12 +376,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "ja": {
         # --- dialog chrome ---
+        "section_app":          "ビデオグリッドプレイヤー",
+        "section_language":     "言語",
+        "section_grid":         "ビデオグリッド",
+        "section_pages":        "グリッドページ",
+        "section_player":       "プレイヤー",
         "dialog_title":         "動画を開く",
         "app_title":            "ビデオグリッドプレイヤー",
         "app_desc":             "動画ファイルの入ったフォルダーを選択してください。\n下の設定に従ってグリッドに表示されます。",
 
         # --- language row ---
         "language_label":       "言語：",
+        "translate_titles":    "動画のタイトルを選択した言語に翻訳する",
 
         # --- grid size ---
         "rows_label":           "行数：",
@@ -347,6 +408,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "再生開始から5秒後にコントロールを自動非表示",
         "chevron_hides_close":  "シェブロンボタンで閉じるボタン（✕）も非表示にする",
         "shuffle":              "シャッフル — 現在の動画が終わったらランダムに再生",
+        "multi_page":           "複数ページ — すべての動画を複数のグリッドページに表示",
+        "page_fill_label":     "動画がページに均等に収まらない場合：",
+        "page_fill_blank":     "空白セルを許可する",
+        "page_fill_round_up":  "ページ数を切り上げる",
+        "page_fill_wrap":      "以前に表示した動画で空白を埋める",
 
         # --- buttons ---
         "choose_folder":        "フォルダーを選択…",
@@ -381,12 +447,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     "ko": {
         # --- dialog chrome ---
+        "section_app":          "비디오 그리드 플레이어",
+        "section_language":     "언어",
+        "section_grid":         "비디오 그리드",
+        "section_pages":        "그리드 페이지",
+        "section_player":       "플레이어",
         "dialog_title":         "동영상 열기",
         "app_title":            "비디오 그리드 플레이어",
         "app_desc":             "동영상 파일이 있는 폴더를 선택하세요.\n아래에서 구성한 그리드에 동영상이 표시됩니다.",
 
         # --- language row ---
         "language_label":       "언어:",
+        "translate_titles":    "동영상 제목을 선택한 언어로 번역 시도",
 
         # --- grid size ---
         "rows_label":           "행:",
@@ -407,6 +479,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "재생 5초 후 화면 컨트롤 자동 숨김",
         "chevron_hides_close":  "시브론 버튼이 닫기 버튼(✕)도 함께 숨김",
         "shuffle":              "셔플 — 현재 동영상이 끝나면 무작위 동영상 재생",
+        "multi_page":           "여러 페이지 — 모든 동영상을 여러 그리드 페이지에 표시",
+        "page_fill_label":     "동영상이 페이지를 균등하게 채우지 못할 때:",
+        "page_fill_blank":     "빈 공간 허용",
+        "page_fill_round_up":  "페이지 수 올림",
+        "page_fill_wrap":      "이전에 표시된 동영상으로 빈 공간 채우기",
 
         # --- buttons ---
         "choose_folder":        "폴더 선택…",

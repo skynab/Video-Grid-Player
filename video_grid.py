@@ -59,8 +59,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-        QPushButton, QSlider, QSpinBox, QStackedWidget, QVBoxLayout,
-        QWidget,
+        QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget,
+        QVBoxLayout, QWidget,
     )
 except ImportError:
     _missing.append("PyQt6")
@@ -151,6 +151,12 @@ TITLE_BAR_HEIGHT = 30
 # source's aspect ratio; any overflow is clipped.
 FIT_STRETCH = "stretch"
 FIT_CLIP = "clip"
+
+# Multi-page fill-mode constants — controls what happens when the video
+# count doesn't divide evenly into pages.
+PAGE_FILL_BLANK    = "blank"     # last page shown with empty/blank cells
+PAGE_FILL_ROUND_UP = "round_up"  # only complete pages shown; trailing videos dropped
+PAGE_FILL_WRAP     = "wrap"      # last page padded by looping from the start
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +381,68 @@ def load_thumbnail_for_video(
             if img is not None:
                 return img
     return extract_thumbnail(path, resolution)
+
+
+# Map our language codes to Google Translate target codes.
+_LANG_TO_GOOGLE: dict[str, str] = {
+    "en": "en",
+    "fr": "fr",
+    "de": "de",
+    "es": "es",
+    "zh": "zh-CN",
+    "ja": "ja",
+    "ko": "ko",
+}
+
+
+def _translate_text(text: str, target: str) -> str:
+    """Translate *text* to *target* using the free Google Translate endpoint.
+    Returns the original text on any network or parse error."""
+    import json
+    import urllib.parse
+    import urllib.request
+    url = (
+        "https://translate.googleapis.com/translate_a/single"
+        "?client=gtx&sl=auto&dt=t&q="
+        + urllib.parse.quote(text)
+        + "&tl=" + urllib.parse.quote(target)
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # Response shape: [[[translated, original, ...], ...], ...]
+        parts = [seg[0] for seg in data[0] if seg[0]]
+        return "".join(parts) or text
+    except Exception:
+        return text
+
+
+class TitleTranslatorWorker(QThread):
+    """Translate a batch of video titles off the GUI thread.
+
+    Emits ``title_ready(idx, translated_text)`` for each title as soon as
+    the translation comes back. Silently skips any title that fails."""
+    title_ready = pyqtSignal(int, str)
+
+    def __init__(self, titles: list[tuple[int, str]], target_lang: str):
+        super().__init__()
+        self._titles = titles          # [(grid_idx, raw_title), ...]
+        self._target = _LANG_TO_GOOGLE.get(target_lang, target_lang)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        if self._target == "en":
+            return
+        for idx, raw in self._titles:
+            if self._stop:
+                break
+            # Replace underscores/hyphens with spaces for better translation.
+            cleaned = raw.replace("_", " ").replace("-", " ").strip()
+            translated = _translate_text(cleaned, self._target)
+            self.title_ready.emit(idx, translated)
 
 
 class ThumbnailWorker(QThread):
@@ -688,16 +756,20 @@ class OpenFolderDialog(QDialog):
                  show_set_thumb_default: bool = True,
                  auto_hide_default: bool = False,
                  shuffle_default: bool = False,
+                 multi_page_default: bool = False,
+                 page_fill_default: str = PAGE_FILL_ROUND_UP,
                  thumbnail_resolution_default: str = DEFAULT_THUMB_RES,
                  chevron_hides_close_default: bool = True,
                  last_folder_default: str = "",
-                 language_default: str = "en"):
+                 language_default: str = "en",
+                 translate_titles_default: bool = False):
         super().__init__(parent)
         self._last_folder_default: str = last_folder_default or ""
         self.language: str = language_default
+        self.translate_titles: bool = translate_titles_default
         tr = get_strings(self.language)
         self.setWindowTitle(tr["dialog_title"])
-        self.setFixedSize(560, 600)
+        self.setFixedSize(580, 660)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -709,27 +781,38 @@ class OpenFolderDialog(QDialog):
         self.show_set_thumb_button: bool = show_set_thumb_default
         self.auto_hide_overlays: bool = auto_hide_default
         self.shuffle_play: bool = shuffle_default
+        self.multi_page: bool = multi_page_default
+        self.page_fill: str = page_fill_default
         self.thumbnail_resolution: str = thumbnail_resolution_default
         self.chevron_hides_close_button: bool = chevron_hides_close_default
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 16)
+        # Outer layout: scroll area + button bar pinned at the bottom.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scrollable content area so the dialog works on small screens.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { background: #1a1a1a; width: 6px; "
+            "                      border-radius: 3px; }"
+            "QScrollBar::handle:vertical { background: #444; "
+            "                              border-radius: 3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            "  { height: 0px; }"
+        )
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(content)
+        root.setContentsMargins(22, 6, 22, 6)
         root.setSpacing(0)
-
-        self._title_label = QLabel(tr["app_title"])
-        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_label.setStyleSheet(
-            "color: white; font-size: 18px; font-weight: bold;")
-        root.addWidget(self._title_label)
-
-        root.addSpacing(7)
-
-        self._desc_label = QLabel(tr["app_desc"])
-        self._desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._desc_label.setStyleSheet("color: #bbbbbb;")
-        root.addWidget(self._desc_label)
-
-        root.addSpacing(12)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
 
         # --- shared styles -----------------------------------------------
         label_style = (
@@ -763,8 +846,94 @@ class OpenFolderDialog(QDialog):
             "   background: #3a3a3a;"
             "}"
         )
+        check_style = (
+            "QCheckBox { color: #dddddd; font-size: 12px; "
+            "            spacing: 8px; background: transparent; }"
+            "QCheckBox::indicator { width: 16px; height: 16px; "
+            "                       border-radius: 3px; "
+            "                       border: 1px solid #666666; "
+            "                       background: #1a1a1a; }"
+            "QCheckBox::indicator:hover { border: 1px solid #888888; }"
+            "QCheckBox::indicator:checked { "
+            "   background: #2b5fa1; border: 1px solid #2b5fa1; "
+            "   image: none; }"
+        )
+        section_style = (
+            "color: white; font-size: 13px; font-weight: bold; "
+            "background: transparent;"
+        )
+        divider_style = "background: #333333;"
 
-        # --- language selector -------------------------------------------
+        def add_section(key: str) -> QLabel:
+            """Add a bold section title with a rule below it; return the label."""
+            root.addSpacing(6)
+            lbl = QLabel(tr[key])
+            lbl.setStyleSheet(section_style)
+            root.addWidget(lbl)
+            rule = QFrame()
+            rule.setFrameShape(QFrame.Shape.HLine)
+            rule.setFixedHeight(1)
+            rule.setStyleSheet(divider_style)
+            root.addWidget(rule)
+            root.addSpacing(4)
+            return lbl
+
+        def add_check(attr: str, tr_key: str, checked: bool,
+                      enabled: bool = True, tip: str = "") -> QCheckBox:
+            cb = QCheckBox(tr[tr_key])
+            cb.setChecked(checked)
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            cb.setStyleSheet(check_style)
+            cb.setEnabled(enabled)
+            if tip:
+                cb.setToolTip(tip)
+            root.addWidget(cb, 0, Qt.AlignmentFlag.AlignHCenter)
+            root.addSpacing(3)
+            return cb
+
+        def add_combo_row(label_tr_key: str,
+                          items: list[tuple[str, str]],
+                          default_data: str) -> tuple:
+            row = QHBoxLayout()
+            row.addStretch(1)
+            lbl = QLabel(tr[label_tr_key])
+            lbl.setStyleSheet(label_style)
+            row.addWidget(lbl)
+            cb = QComboBox()
+            cb.setStyleSheet(combo_style)
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            for data, tr_key in items:
+                cb.addItem(tr[tr_key], data)
+            idx = cb.findData(default_data)
+            cb.setCurrentIndex(max(0, idx))
+            row.addWidget(cb)
+            row.addStretch(1)
+            root.addLayout(row)
+            root.addSpacing(3)
+            return lbl, cb
+
+        # ═══════════════════════════════════════════════════════════════════
+        # App title (centred, not a section header)
+        # ═══════════════════════════════════════════════════════════════════
+        self._sec_app = QLabel(tr["section_app"])
+        self._sec_app.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sec_app.setStyleSheet(
+            "color: white; font-size: 18px; font-weight: bold; "
+            "background: transparent;")
+        root.addWidget(self._sec_app)
+        root.addSpacing(3)
+
+        self._title_label = QLabel(tr["app_desc"])
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setStyleSheet("color: #bbbbbb; font-size: 12px;")
+        self._title_label.setWordWrap(True)
+        root.addWidget(self._title_label)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section: Language
+        # ═══════════════════════════════════════════════════════════════════
+        self._sec_language = add_section("section_language")
+
         lang_row = QHBoxLayout()
         lang_row.addStretch(1)
         self._lang_label = QLabel(tr["language_label"])
@@ -780,158 +949,104 @@ class OpenFolderDialog(QDialog):
         lang_row.addWidget(self.lang_combo)
         lang_row.addStretch(1)
         root.addLayout(lang_row)
+        root.addSpacing(3)
         self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
 
-        root.addSpacing(10)
+        self.translate_titles_checkbox = add_check(
+            "translate_titles", "translate_titles", translate_titles_default)
 
-        # --- grid size controls ------------------------------------------
+        # ═══════════════════════════════════════════════════════════════════
+        # Section: Video Grid
+        # ═══════════════════════════════════════════════════════════════════
+        self._sec_grid = add_section("section_grid")
+
         grid_row = QHBoxLayout()
         grid_row.addStretch(1)
-
         self._rows_label = QLabel(tr["rows_label"])
         self._rows_label.setStyleSheet(label_style)
         grid_row.addWidget(self._rows_label)
-
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(1, MAX_GRID_DIM)
         self.rows_spin.setValue(rows_default)
         self.rows_spin.setStyleSheet(spin_style)
         grid_row.addWidget(self.rows_spin)
-
         grid_row.addSpacing(24)
-
         self._cols_label = QLabel(tr["cols_label"])
         self._cols_label.setStyleSheet(label_style)
         grid_row.addWidget(self._cols_label)
-
         self.cols_spin = QSpinBox()
         self.cols_spin.setRange(1, MAX_GRID_DIM)
         self.cols_spin.setValue(cols_default)
         self.cols_spin.setStyleSheet(spin_style)
         grid_row.addWidget(self.cols_spin)
-
         grid_row.addStretch(1)
         root.addLayout(grid_row)
+        root.addSpacing(4)
 
-        root.addSpacing(10)
+        self._res_label, self.res_combo = add_combo_row(
+            "thumb_quality_label",
+            [(THUMB_RES_STANDARD, "thumb_standard"),
+             (THUMB_RES_HIGH,     "thumb_high"),
+             (THUMB_RES_ULTRA,    "thumb_ultra")],
+            thumbnail_resolution_default)
+        # Correct selection in case the stored value wasn't found.
+        if self.res_combo.currentIndex() < 0:
+            self.res_combo.setCurrentIndex(
+                max(0, self.res_combo.findData(DEFAULT_THUMB_RES)))
 
-        # --- thumbnail resolution ----------------------------------------
-        res_row = QHBoxLayout()
-        res_row.addStretch(1)
-        self._res_label = QLabel(tr["thumb_quality_label"])
-        self._res_label.setStyleSheet(label_style)
-        res_row.addWidget(self._res_label)
-        self.res_combo = QComboBox()
-        self.res_combo.setStyleSheet(combo_style)
-        self.res_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        for key, tr_key in (
-            (THUMB_RES_STANDARD, "thumb_standard"),
-            (THUMB_RES_HIGH,     "thumb_high"),
-            (THUMB_RES_ULTRA,    "thumb_ultra"),
-        ):
-            self.res_combo.addItem(tr[tr_key], key)
-        # Select the current default
-        idx = self.res_combo.findData(thumbnail_resolution_default)
-        if idx < 0:
-            idx = self.res_combo.findData(DEFAULT_THUMB_RES)
-        self.res_combo.setCurrentIndex(max(0, idx))
-        res_row.addWidget(self.res_combo)
-        res_row.addStretch(1)
-        root.addLayout(res_row)
+        self.titles_checkbox     = add_check("show_titles",  "show_titles",
+                                             show_titles_default)
+        self.full_width_checkbox = add_check("full_width",   "full_width",
+                                             full_width_default)
+        self.sidecar_checkbox    = add_check("use_sidecar",  "use_sidecar",
+                                             use_sidecar_default)
+        self.clip_thumb_checkbox = add_check("clip_thumb",   "clip_thumb",
+                                             thumbnail_fit_default == FIT_CLIP)
 
-        root.addSpacing(10)
+        # ═══════════════════════════════════════════════════════════════════
+        # Section: Video Grid Pages
+        # ═══════════════════════════════════════════════════════════════════
+        self._sec_pages = add_section("section_pages")
 
-        # --- options ------------------------------------------------------
-        check_style = (
-            "QCheckBox { color: #dddddd; font-size: 12px; "
-            "            spacing: 8px; background: transparent; }"
-            "QCheckBox::indicator { width: 16px; height: 16px; "
-            "                       border-radius: 3px; "
-            "                       border: 1px solid #666666; "
-            "                       background: #1a1a1a; }"
-            "QCheckBox::indicator:hover { border: 1px solid #888888; }"
-            "QCheckBox::indicator:checked { "
-            "   background: #2b5fa1; border: 1px solid #2b5fa1; "
-            "   image: none; }"
-        )
+        self.multi_page_checkbox = add_check("multi_page", "multi_page",
+                                             multi_page_default)
 
-        self.titles_checkbox = QCheckBox(tr["show_titles"])
-        self.titles_checkbox.setChecked(show_titles_default)
-        self.titles_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.titles_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.titles_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
+        self._page_fill_label, self.page_fill_combo = add_combo_row(
+            "page_fill_label",
+            [(PAGE_FILL_BLANK,    "page_fill_blank"),
+             (PAGE_FILL_ROUND_UP, "page_fill_round_up"),
+             (PAGE_FILL_WRAP,     "page_fill_wrap")],
+            page_fill_default)
 
-        root.addSpacing(7)
+        # ═══════════════════════════════════════════════════════════════════
+        # Section: Player
+        # ═══════════════════════════════════════════════════════════════════
+        self._sec_player = add_section("section_player")
 
-        self.full_width_checkbox = QCheckBox(tr["full_width"])
-        self.full_width_checkbox.setChecked(full_width_default)
-        self.full_width_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.full_width_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.full_width_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
-
-        root.addSpacing(7)
-
-        self.sidecar_checkbox = QCheckBox(tr["use_sidecar"])
-        self.sidecar_checkbox.setChecked(use_sidecar_default)
-        self.sidecar_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sidecar_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.sidecar_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
-
-        root.addSpacing(7)
-
-        self.clip_thumb_checkbox = QCheckBox(tr["clip_thumb"])
-        self.clip_thumb_checkbox.setChecked(
-            thumbnail_fit_default == FIT_CLIP)
-        self.clip_thumb_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clip_thumb_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.clip_thumb_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
-
-        root.addSpacing(7)
-
-        self.set_thumb_button_checkbox = QCheckBox(tr["show_set_thumb_btn"])
-        self.set_thumb_button_checkbox.setChecked(show_set_thumb_default)
-        self.set_thumb_button_checkbox.setCursor(
-            Qt.CursorShape.PointingHandCursor)
-        self.set_thumb_button_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.set_thumb_button_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
-
-        root.addSpacing(7)
-
-        self.auto_hide_checkbox = QCheckBox(tr["auto_hide"])
-        self.auto_hide_checkbox.setChecked(auto_hide_default)
-        self.auto_hide_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.auto_hide_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.auto_hide_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
-
-        root.addSpacing(7)
-
-        self.chevron_hides_close_checkbox = QCheckBox(tr["chevron_hides_close"])
-        self.chevron_hides_close_checkbox.setChecked(
+        self.set_thumb_button_checkbox = add_check(
+            "show_set_thumb_btn", "show_set_thumb_btn", show_set_thumb_default)
+        self.auto_hide_checkbox = add_check(
+            "auto_hide", "auto_hide", auto_hide_default)
+        self.chevron_hides_close_checkbox = add_check(
+            "chevron_hides_close", "chevron_hides_close",
             chevron_hides_close_default)
-        self.chevron_hides_close_checkbox.setCursor(
-            Qt.CursorShape.PointingHandCursor)
-        self.chevron_hides_close_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.chevron_hides_close_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
+        self.shuffle_checkbox = add_check(
+            "shuffle", "shuffle", shuffle_default)
 
-        root.addSpacing(7)
+        root.addSpacing(4)
 
-        self.shuffle_checkbox = QCheckBox(tr["shuffle"])
-        self.shuffle_checkbox.setChecked(shuffle_default)
-        self.shuffle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.shuffle_checkbox.setStyleSheet(check_style)
-        root.addWidget(self.shuffle_checkbox, 0,
-                       Qt.AlignmentFlag.AlignHCenter)
+        # ═══════════════════════════════════════════════════════════════════
+        # Button bar — sits outside the scroll area, always visible
+        # ═══════════════════════════════════════════════════════════════════
+        btn_container = QWidget()
+        btn_container.setStyleSheet(
+            "background: #181818; border-top: 1px solid #2a2a2a;")
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(22, 10, 22, 12)
+        btn_layout.setSpacing(0)
+        outer.addWidget(btn_container)
 
-        root.addSpacing(14)
-
-        # --- buttons ------------------------------------------------------
+        # --- buttons (inside btn_container, always visible) ---------------
         row = QHBoxLayout()
         row.addStretch(1)
 
@@ -980,7 +1095,7 @@ class OpenFolderDialog(QDialog):
         row.addWidget(self._cancel_button)
 
         row.addStretch(1)
-        root.addLayout(row)
+        btn_layout.addLayout(row)
 
     def _on_language_changed(self) -> None:
         code = self.lang_combo.currentData()
@@ -992,20 +1107,34 @@ class OpenFolderDialog(QDialog):
         """Update every translatable widget text to the current language."""
         tr = get_strings(self.language)
         self.setWindowTitle(tr["dialog_title"])
-        self._title_label.setText(tr["app_title"])
-        self._desc_label.setText(tr["app_desc"])
+        # Section headers
+        self._sec_app.setText(tr["section_app"])
+        self._sec_language.setText(tr["section_language"])
+        self._sec_grid.setText(tr["section_grid"])
+        self._sec_pages.setText(tr["section_pages"])
+        self._sec_player.setText(tr["section_player"])
+        # App description (repurposed as _title_label)
+        self._title_label.setText(tr["app_desc"])
+        # Language section
         self._lang_label.setText(tr["language_label"])
+        self.translate_titles_checkbox.setText(tr["translate_titles"])
+        # Grid section
         self._rows_label.setText(tr["rows_label"])
         self._cols_label.setText(tr["cols_label"])
         self._res_label.setText(tr["thumb_quality_label"])
-        # Res combo items (labels change, data keys stay)
         for i, tr_key in enumerate(("thumb_standard", "thumb_high", "thumb_ultra")):
             self.res_combo.setItemText(i, tr[tr_key])
-        # Checkboxes
         self.titles_checkbox.setText(tr["show_titles"])
         self.full_width_checkbox.setText(tr["full_width"])
         self.sidecar_checkbox.setText(tr["use_sidecar"])
         self.clip_thumb_checkbox.setText(tr["clip_thumb"])
+        # Pages section
+        self.multi_page_checkbox.setText(tr["multi_page"])
+        self._page_fill_label.setText(tr["page_fill_label"])
+        for i, tr_key in enumerate(
+                ("page_fill_blank", "page_fill_round_up", "page_fill_wrap")):
+            self.page_fill_combo.setItemText(i, tr[tr_key])
+        # Player section
         self.set_thumb_button_checkbox.setText(tr["show_set_thumb_btn"])
         self.auto_hide_checkbox.setText(tr["auto_hide"])
         self.chevron_hides_close_checkbox.setText(tr["chevron_hides_close"])
@@ -1042,6 +1171,11 @@ class OpenFolderDialog(QDialog):
         self.chevron_hides_close_button = (
             self.chevron_hides_close_checkbox.isChecked())
         self.shuffle_play = self.shuffle_checkbox.isChecked()
+        self.multi_page = self.multi_page_checkbox.isChecked()
+        fill_key = self.page_fill_combo.currentData()
+        if fill_key in (PAGE_FILL_BLANK, PAGE_FILL_ROUND_UP, PAGE_FILL_WRAP):
+            self.page_fill = fill_key
+        self.translate_titles = self.translate_titles_checkbox.isChecked()
         res_key = self.res_combo.currentData()
         if res_key in THUMB_RESOLUTIONS:
             self.thumbnail_resolution = res_key
@@ -1139,6 +1273,12 @@ class VideoGridApp(QMainWindow):
         self.auto_hide_overlays: bool = False     # auto-hide after 5 seconds
         self._overlays_hidden: bool = False       # current hide/show state
         self.shuffle_play: bool = False           # play random next on end
+        self.multi_page: bool = False             # show all videos across pages
+        self.page_fill: str = PAGE_FILL_ROUND_UP  # fill-mode for uneven pages
+        self.translate_titles: bool = False       # translate filenames via API
+        self.title_worker: TitleTranslatorWorker | None = None
+        self.all_video_files: list[str] = []      # full unsliced video list
+        self.current_page: int = 0                # 0-based page index
         self.thumbnail_resolution: str = DEFAULT_THUMB_RES  # decoded thumb size
         self.chevron_hides_close_button: bool = True  # ✕ vanishes on collapse?
         self.last_folder: str = ""  # most recent folder loaded; "" if none yet
@@ -1751,6 +1891,152 @@ class VideoGridApp(QMainWindow):
         self._place_overlay(self.overlay_toggle, x, y)
         self.overlay_toggle.raise_()
 
+    # --------------------------------------------------- page arrow overlays --
+    def _build_page_arrows(self) -> None:
+        """Two semi-transparent chevron buttons anchored to the left and
+        right edges of the grid, used to navigate between pages when
+        multi-page mode is enabled."""
+        arrow_style = (
+            "QPushButton {{"
+            "  background-color: rgba(0, 0, 0, 160);"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: {r}px;"
+            "  font-size: 28px;"
+            "  font-weight: bold;"
+            "  padding: 0;"
+            "}}"
+            "QPushButton:hover {{"
+            "  background-color: rgba(43, 95, 161, 210);"
+            "}}"
+            "QPushButton:pressed {{"
+            "  background-color: rgba(36, 82, 139, 230);"
+            "}}"
+        )
+        btn_w, btn_h, radius = 48, 96, 24
+
+        self.prev_page_button = QPushButton("❮", self)  # ❮
+        self.prev_page_button.setObjectName("prevPageBtn")
+        self.prev_page_button.setFixedSize(btn_w, btn_h)
+        self.prev_page_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_page_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.prev_page_button.setToolTip("Previous page")
+        self.prev_page_button.setStyleSheet(
+            arrow_style.format(r=radius))
+        self._promote_to_overlay_window(self.prev_page_button)
+        apply_rounded_mask(self.prev_page_button, radius)
+        self.prev_page_button.clicked.connect(
+            lambda: self._go_to_page(self.current_page - 1))
+        self.prev_page_button.hide()
+
+        self.next_page_button = QPushButton("❯", self)  # ❯
+        self.next_page_button.setObjectName("nextPageBtn")
+        self.next_page_button.setFixedSize(btn_w, btn_h)
+        self.next_page_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.next_page_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.next_page_button.setToolTip("Next page")
+        self.next_page_button.setStyleSheet(
+            arrow_style.format(r=radius))
+        self._promote_to_overlay_window(self.next_page_button)
+        apply_rounded_mask(self.next_page_button, radius)
+        self.next_page_button.clicked.connect(
+            lambda: self._go_to_page(self.current_page + 1))
+        self.next_page_button.hide()
+
+    def _position_page_arrows(self) -> None:
+        """Pin the prev/next arrows to the vertical centre of the window,
+        flush with the left and right edges (with a small inset)."""
+        inset = 12
+        btn_w = self.prev_page_button.width()
+        btn_h = self.prev_page_button.height()
+        y = (self.height() - btn_h) // 2
+        self._place_overlay(self.prev_page_button, inset, y)
+        self._place_overlay(
+            self.next_page_button, self.width() - btn_w - inset, y)
+
+    def _total_pages(self) -> int:
+        """Number of navigable pages given the current fill mode."""
+        n = len(self.all_video_files)
+        if n == 0:
+            return 1
+        page_size = self.grid_rows * self.grid_cols
+        if self.page_fill == PAGE_FILL_ROUND_UP:
+            # Only complete pages; trailing videos that don't fill a page
+            # are not shown.
+            return max(1, n // page_size)
+        else:
+            # BLANK and WRAP both show ceil pages.
+            return max(1, -(-n // page_size))
+
+    def _page_video_slice(self, page: int) -> list[str]:
+        """Return the list of video paths for *page* under the current fill mode."""
+        page_size = self.grid_rows * self.grid_cols
+        start = page * page_size
+        chunk = self.all_video_files[start:start + page_size]
+
+        if self.page_fill == PAGE_FILL_WRAP and 0 < len(chunk) < page_size:
+            # Pad by looping from the beginning of the full list.
+            shortage = page_size - len(chunk)
+            chunk = chunk + self.all_video_files[:shortage]
+
+        # ROUND_UP and BLANK: return chunk as-is (may be short for last page).
+        return chunk
+
+    def _update_page_arrows(self) -> None:
+        """Show or hide the prev/next arrows based on whether multi-page
+        mode is on and how many pages of videos there are."""
+        if self.is_playing:
+            self.prev_page_button.hide()
+            self.next_page_button.hide()
+            return
+
+        total_pages = self._total_pages()
+        show_prev = self.multi_page and self.current_page > 0
+        show_next = self.multi_page and self.current_page < total_pages - 1
+
+        # Position both buttons first (using current window geometry), then
+        # show or hide each one. Showing before positioning caused the button
+        # to appear at its default (0,0) location on first display.
+        self._position_page_arrows()
+
+        if show_prev:
+            self.prev_page_button.show()
+            self.prev_page_button.raise_()
+        else:
+            self.prev_page_button.hide()
+
+        if show_next:
+            self.next_page_button.show()
+            self.next_page_button.raise_()
+        else:
+            self.next_page_button.hide()
+
+    def _go_to_page(self, page: int) -> None:
+        """Switch the grid to *page* (0-based), reloading thumbnails."""
+        total_pages = self._total_pages()
+        page = max(0, min(page, total_pages - 1))
+        if page == self.current_page and self.video_files:
+            return
+
+        self.current_page = page
+        self.video_files = self._page_video_slice(page)
+
+        self._render_grid()
+        self._update_page_arrows()
+
+        # Restart thumbnail and title-translation workers for the new page.
+        if self.thumb_worker is not None:
+            self.thumb_worker.stop()
+            self.thumb_worker.wait(2000)
+        self.thumb_worker = ThumbnailWorker(
+            list(self.video_files),
+            use_sidecar=self.use_sidecar_thumbnails,
+            resolution=self.thumbnail_resolution,
+        )
+        self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail)
+        self.thumb_worker.start()
+        self._start_title_translation()
+
     def _build_auto_hide_timer(self) -> None:
         """Single-shot timer that fires 5 seconds after playback begins
         (or after the user reveals the controls) to auto-collapse the
@@ -1892,6 +2178,9 @@ class VideoGridApp(QMainWindow):
         ("shuffle_play", bool, False),
         ("thumbnail_resolution", str, DEFAULT_THUMB_RES),
         ("chevron_hides_close_button", bool, True),
+        ("multi_page", bool, False),
+        ("page_fill", str, PAGE_FILL_ROUND_UP),
+        ("translate_titles", bool, False),
         ("last_folder", str, ""),
         ("language", str, "en"),
     )
@@ -1956,6 +2245,9 @@ class VideoGridApp(QMainWindow):
                 value = DEFAULT_THUMB_RES
             if attr == "thumbnail_fit" and value not in (FIT_STRETCH, FIT_CLIP):
                 value = FIT_STRETCH
+            if attr == "page_fill" and value not in (
+                    PAGE_FILL_BLANK, PAGE_FILL_ROUND_UP, PAGE_FILL_WRAP):
+                value = PAGE_FILL_ROUND_UP
             if attr in ("grid_rows", "grid_cols"):
                 value = max(1, min(MAX_GRID_DIM, int(value)))
             setattr(self, attr, value)
@@ -1993,10 +2285,13 @@ class VideoGridApp(QMainWindow):
             show_set_thumb_default=self.show_set_thumb_button,
             auto_hide_default=self.auto_hide_overlays,
             shuffle_default=self.shuffle_play,
+            multi_page_default=self.multi_page,
+            page_fill_default=self.page_fill,
             thumbnail_resolution_default=self.thumbnail_resolution,
             chevron_hides_close_default=self.chevron_hides_close_button,
             last_folder_default=self.last_folder,
             language_default=self.language,
+            translate_titles_default=self.translate_titles,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -2008,6 +2303,9 @@ class VideoGridApp(QMainWindow):
             self.show_set_thumb_button = dlg.show_set_thumb_button
             self.auto_hide_overlays = dlg.auto_hide_overlays
             self.shuffle_play = dlg.shuffle_play
+            self.multi_page = dlg.multi_page
+            self.page_fill = dlg.page_fill
+            self.translate_titles = dlg.translate_titles
             self.thumbnail_resolution = dlg.thumbnail_resolution
             self.chevron_hides_close_button = dlg.chevron_hides_close_button
             self.language = dlg.language
@@ -2037,7 +2335,9 @@ class VideoGridApp(QMainWindow):
                 self._tr("no_videos_msg").format(exts=", ".join(VIDEO_EXTS)))
             return
 
-        self.video_files = videos[:self.grid_rows * self.grid_cols]
+        self.all_video_files = videos
+        self.current_page = 0
+        self.video_files = self._page_video_slice(0)
         self.thumbnails.clear()
         self._render_grid()
 
@@ -2060,6 +2360,40 @@ class VideoGridApp(QMainWindow):
         )
         self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail)
         self.thumb_worker.start()
+
+        self._start_title_translation()
+
+    def _start_title_translation(self) -> None:
+        """Kick off a background worker to translate the current page's
+        video titles if the option is enabled and a non-English language
+        is selected. Stops any previously running translation worker first."""
+        if self.title_worker is not None:
+            self.title_worker.stop()
+            self.title_worker.wait(1000)
+            self.title_worker = None
+
+        if not self.translate_titles:
+            return
+        if self.language == "en":
+            return
+
+        titles = []
+        for idx, entry in enumerate(self.cell_widgets):
+            if entry is not None:
+                raw = entry["title"].property("fullText") or ""
+                titles.append((idx, str(raw)))
+
+        if not titles:
+            return
+
+        self.title_worker = TitleTranslatorWorker(titles, self.language)
+        self.title_worker.title_ready.connect(self._on_title_translated)
+        self.title_worker.start()
+
+    def _on_title_translated(self, idx: int, text: str) -> None:
+        if idx >= len(self.cell_widgets) or self.cell_widgets[idx] is None:
+            return
+        self._set_title_text(self.cell_widgets[idx]["title"], text)
 
     def _on_thumbnail(self, idx: int, path: str, qimg: QImage) -> None:
         if idx >= len(self.video_files) or self.video_files[idx] != path:
@@ -2755,6 +3089,9 @@ class VideoGridApp(QMainWindow):
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
+        if self.title_worker is not None:
+            self.title_worker.stop()
+            self.title_worker.wait(1000)
         # Use the safe stop path that detaches the render HWND first,
         # then release the player / instance. Without the HWND detach,
         # VLC can hang on app-exit with the d3d11 vout bug.
