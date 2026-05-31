@@ -1,6 +1,20 @@
 # Video Grid Player
 
-A cross-platform desktop app (Windows / macOS / Linux) that shows your videos in a configurable grid (up to 6 rows × 6 columns, default 3×4) with real thumbnail previews extracted from each video. Each cell can show the file name (extension hidden) as a title. Clicking a cell plays the video **fullscreen inside the same application** — no external player is launched. A floating circular ✕ button and a bottom scrubber/timeline are overlaid on the video while playing. When playback finishes, or `Esc` is pressed, or the ✕ is clicked, the app returns to the grid view.
+A cross-platform desktop app (Windows / macOS / Linux?) that shows your videos in a configurable grid (up to 6 rows × 6 columns, default 3×4) with real thumbnail previews extracted from each video. Each cell can show the file name (extension hidden) as a title. Clicking a cell plays the video **fullscreen inside the same application** — no external player is launched. A floating circular ✕ button and a bottom scrubber/timeline are overlaid on the video while playing. When playback finishes, or `Esc` is pressed, or the ✕ is clicked, the app returns to the grid view.
+
+<img width="1000" height="592" alt="Video-Grid-Example" src="https://github.com/user-attachments/assets/d134a8d7-901e-40d2-b6cf-06cc2141b940" />
+
+The popup also has an **"Open Last Folder"** button alongside **"Choose Folder…"**. It reuses the most recently loaded folder without going through the OS file picker, which is handy when you keep opening the same library. The button is disabled if you've never loaded a folder before, or if the previously loaded folder no longer exists on disk.
+
+All choices in the popup (grid size, full-width layout, thumbnail resolution, sidecar images, auto-hide, shuffle, chevron behavior, last folder, etc.) are saved automatically whenever you click **Choose Folder…** or **Open Last Folder**, and restored the next time the app starts. The store lives at:
+
+| Platform | Location |
+| --- | --- |
+| Windows | `HKCU\Software\VideoGridPlayer\VideoGridPlayer` (registry) |
+| macOS | `~/Library/Preferences/com.VideoGridPlayer.VideoGridPlayer.plist` |
+| Linux | `~/.config/VideoGridPlayer/VideoGridPlayer.conf` |
+
+## Thumbnails
 
 The folder picker opens in a clean modal popup — either automatically on startup, or from **File → Open Folder…** — so the main window stays uncluttered. The popup also lets you:
 
@@ -66,6 +80,17 @@ The GUI is PyQt6 (so native window handles are available on every OS — Tkinter
 ```sh
 python video_grid.py                      # launches with the popup picker
 python video_grid.py "/path/to/videos"    # preload a folder, skip popup
+```
+
+## Tests
+
+A small pytest suite under `tests/` exercises the pure helpers (thumbnail resolution lookup, time formatting, QSettings type coercion, cache path derivation, sidecar discovery). The same suite runs in CI on Ubuntu, macOS, and Windows via `.github/workflows/tests.yml` on every pull request.
+
+To run the tests locally:
+
+```sh
+pip install PyQt6 opencv-python-headless numpy pytest
+QT_QPA_PLATFORM=offscreen pytest -v tests
 ```
 
 Or use **File → Open Folder…** from inside the app at any time.
