@@ -1247,29 +1247,6 @@ class OpenFolderDialog(QDialog):
         if lang_key in LANGUAGES:
             self.language = lang_key
 
-    def _commit_widget_values(self) -> None:
-        """Pull the current state of every option widget into this
-        dialog's public attributes. Shared by the Choose Folder and
-        Open Last Folder paths so both honor any tweaks the user made
-        in the popup before clicking."""
-        self.show_titles = self.titles_checkbox.isChecked()
-        self.grid_rows = self.rows_spin.value()
-        self.grid_cols = self.cols_spin.value()
-        self.full_width = self.full_width_checkbox.isChecked()
-        self.use_sidecar = self.sidecar_checkbox.isChecked()
-        self.thumbnail_fit = (
-            FIT_CLIP if self.clip_thumb_checkbox.isChecked()
-            else FIT_STRETCH)
-        self.show_set_thumb_button = (
-            self.set_thumb_button_checkbox.isChecked())
-        self.auto_hide_overlays = self.auto_hide_checkbox.isChecked()
-        self.chevron_hides_close_button = (
-            self.chevron_hides_close_checkbox.isChecked())
-        self.shuffle_play = self.shuffle_checkbox.isChecked()
-        res_key = self.res_combo.currentData()
-        if res_key in THUMB_RESOLUTIONS:
-            self.thumbnail_resolution = res_key
-
     def _choose_folder(self) -> None:
         # Default the OS picker to the last folder we used, if it still
         # exists; otherwise fall back to the user's home directory.
@@ -2054,9 +2031,6 @@ class VideoGridApp(QMainWindow):
             return
 
         total_pages = self._total_pages()
-        page_size = self.grid_rows * self.grid_cols
-        total_pages = max(1, -(-len(self.all_video_files) // page_size))  # ceil
-
         show_prev = self.multi_page and self.current_page > 0
         show_next = self.multi_page and self.current_page < total_pages - 1
 
@@ -2080,16 +2054,12 @@ class VideoGridApp(QMainWindow):
     def _go_to_page(self, page: int) -> None:
         """Switch the grid to *page* (0-based), reloading thumbnails."""
         total_pages = self._total_pages()
-        page_size = self.grid_rows * self.grid_cols
-        total_pages = max(1, -(-len(self.all_video_files) // page_size))
         page = max(0, min(page, total_pages - 1))
         if page == self.current_page and self.video_files:
             return
 
         self.current_page = page
         self.video_files = self._page_video_slice(page)
-        start = page * page_size
-        self.video_files = self.all_video_files[start:start + page_size]
 
         self._render_grid()
         self._update_page_arrows()
