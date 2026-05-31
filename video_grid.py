@@ -157,6 +157,8 @@ TITLE_BAR_HEIGHT = 30
 FIT_STRETCH = "stretch"
 FIT_CLIP = "clip"
 
+APP_VERSION = "1.2.0"
+
 # Multi-page fill-mode constants — controls what happens when the video
 # count doesn't divide evenly into pages.
 PAGE_FILL_BLANK    = "blank"     # last page shown with empty/blank cells
@@ -975,6 +977,12 @@ class OpenFolderDialog(QDialog):
         self._title_label.setStyleSheet("color: #bbbbbb; font-size: 12px;")
         self._title_label.setWordWrap(True)
         root.addWidget(self._title_label)
+
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_label.setStyleSheet(
+            "color: #555555; font-size: 11px; background: transparent;")
+        root.addWidget(version_label)
 
         # ═══════════════════════════════════════════════════════════════════
         # Section: Language
