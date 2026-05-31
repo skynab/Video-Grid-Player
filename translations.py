@@ -47,6 +47,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Auto-hide on-screen controls after 5 seconds of playback",
         "chevron_hides_close":  "Chevron button also hides the close (✕) button",
         "shuffle":              "Shuffle — play a random video when the current one ends",
+        "multi_page":           "Multiple pages — show all videos across multiple grid pages",
 
         # --- buttons ---
         "choose_folder":        "Choose Folder…",
@@ -107,6 +108,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Masquer automatiquement les commandes après 5 secondes de lecture",
         "chevron_hides_close":  "Le bouton chevron masque aussi le bouton fermer (✕)",
         "shuffle":              "Aléatoire — lire une vidéo aléatoire à la fin de la vidéo en cours",
+        "multi_page":           "Pages multiples — afficher toutes les vidéos sur plusieurs pages",
 
         # --- buttons ---
         "choose_folder":        "Choisir un dossier…",
@@ -167,6 +169,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Steuerung nach 5 Sekunden automatisch ausblenden",
         "chevron_hides_close":  "Chevron-Schaltfläche blendet auch die Schließen-Schaltfläche (✕) aus",
         "shuffle":              "Zufallswiedergabe — nach dem Ende ein zufälliges Video abspielen",
+        "multi_page":           "Mehrere Seiten — alle Videos auf mehreren Rasterseiten anzeigen",
 
         # --- buttons ---
         "choose_folder":        "Ordner auswählen…",
@@ -227,6 +230,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "Ocultar controles automáticamente después de 5 segundos de reproducción",
         "chevron_hides_close":  "El botón de cheurón también oculta el botón de cerrar (✕)",
         "shuffle":              "Aleatorio — reproducir un vídeo aleatorio al terminar el actual",
+        "multi_page":           "Varias páginas — mostrar todos los vídeos en varias páginas de cuadrícula",
 
         # --- buttons ---
         "choose_folder":        "Elegir carpeta…",
@@ -287,6 +291,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "播放 5 秒后自动隐藏屏幕控件",
         "chevron_hides_close":  "折叠按钮同时隐藏关闭按钮（✕）",
         "shuffle":              "随机播放 — 当前视频结束后随机播放下一个",
+        "multi_page":           "多页显示 — 在多个网格页面中显示所有视频",
 
         # --- buttons ---
         "choose_folder":        "选择文件夹…",
@@ -347,6 +352,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "再生開始から5秒後にコントロールを自動非表示",
         "chevron_hides_close":  "シェブロンボタンで閉じるボタン（✕）も非表示にする",
         "shuffle":              "シャッフル — 現在の動画が終わったらランダムに再生",
+        "multi_page":           "複数ページ — すべての動画を複数のグリッドページに表示",
 
         # --- buttons ---
         "choose_folder":        "フォルダーを選択…",
@@ -407,6 +413,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auto_hide":            "재생 5초 후 화면 컨트롤 자동 숨김",
         "chevron_hides_close":  "시브론 버튼이 닫기 버튼(✕)도 함께 숨김",
         "shuffle":              "셔플 — 현재 동영상이 끝나면 무작위 동영상 재생",
+        "multi_page":           "여러 페이지 — 모든 동영상을 여러 그리드 페이지에 표시",
 
         # --- buttons ---
         "choose_folder":        "폴더 선택…",
