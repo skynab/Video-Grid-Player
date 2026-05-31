@@ -1047,6 +1047,33 @@ class OpenFolderDialog(QDialog):
         outer.addWidget(btn_container)
 
         # --- buttons (inside btn_container, always visible) ---------------
+        self.chevron_hides_close_checkbox.setCursor(
+            Qt.CursorShape.PointingHandCursor)
+        self.chevron_hides_close_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.chevron_hides_close_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.shuffle_checkbox = QCheckBox(tr["shuffle"])
+        self.shuffle_checkbox.setChecked(shuffle_default)
+        self.shuffle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shuffle_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.shuffle_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(7)
+
+        self.multi_page_checkbox = QCheckBox(tr["multi_page"])
+        self.multi_page_checkbox.setChecked(multi_page_default)
+        self.multi_page_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.multi_page_checkbox.setStyleSheet(check_style)
+        root.addWidget(self.multi_page_checkbox, 0,
+                       Qt.AlignmentFlag.AlignHCenter)
+
+        root.addSpacing(14)
+
+        # --- buttons ------------------------------------------------------
         row = QHBoxLayout()
         row.addStretch(1)
 
@@ -1139,6 +1166,7 @@ class OpenFolderDialog(QDialog):
         self.auto_hide_checkbox.setText(tr["auto_hide"])
         self.chevron_hides_close_checkbox.setText(tr["chevron_hides_close"])
         self.shuffle_checkbox.setText(tr["shuffle"])
+        self.multi_page_checkbox.setText(tr["multi_page"])
         # Buttons
         self._choose_button.setText(tr["choose_folder"])
         self.reopen_button.setText(tr["open_last"])
@@ -1306,6 +1334,7 @@ class VideoGridApp(QMainWindow):
         self._build_loop_overlay()
         self._build_jog_overlay()
         self._build_overlay_toggle()
+        self._build_page_arrows()
         self._build_auto_hide_timer()
         self.stack.setCurrentWidget(self.grid_page)
 
@@ -1991,6 +2020,9 @@ class VideoGridApp(QMainWindow):
             return
 
         total_pages = self._total_pages()
+        page_size = self.grid_rows * self.grid_cols
+        total_pages = max(1, -(-len(self.all_video_files) // page_size))  # ceil
+
         show_prev = self.multi_page and self.current_page > 0
         show_next = self.multi_page and self.current_page < total_pages - 1
 
@@ -2014,17 +2046,22 @@ class VideoGridApp(QMainWindow):
     def _go_to_page(self, page: int) -> None:
         """Switch the grid to *page* (0-based), reloading thumbnails."""
         total_pages = self._total_pages()
+        page_size = self.grid_rows * self.grid_cols
+        total_pages = max(1, -(-len(self.all_video_files) // page_size))
         page = max(0, min(page, total_pages - 1))
         if page == self.current_page and self.video_files:
             return
 
         self.current_page = page
         self.video_files = self._page_video_slice(page)
+        start = page * page_size
+        self.video_files = self.all_video_files[start:start + page_size]
 
         self._render_grid()
         self._update_page_arrows()
 
         # Restart thumbnail and title-translation workers for the new page.
+        # Restart the thumbnail worker for the new page's videos
         if self.thumb_worker is not None:
             self.thumb_worker.stop()
             self.thumb_worker.wait(2000)
@@ -2338,8 +2375,14 @@ class VideoGridApp(QMainWindow):
         self.all_video_files = videos
         self.current_page = 0
         self.video_files = self._page_video_slice(0)
+        page_size = self.grid_rows * self.grid_cols
+        if self.multi_page:
+            self.video_files = videos[:page_size]
+        else:
+            self.video_files = videos[:page_size]
         self.thumbnails.clear()
         self._render_grid()
+        QTimer.singleShot(0, self._update_page_arrows)
 
         # Remember this folder so the next run's "Open Last Folder"
         # button can jump straight back to it.
@@ -2660,6 +2703,8 @@ class VideoGridApp(QMainWindow):
         # of the video.
         self._position_close_button()
         self.close_button.show()
+        self.prev_page_button.hide()
+        self.next_page_button.hide()
 
         # Reset the "Set Thumbnail" button label in case it was showing
         # the "✓ Thumbnail Set" confirmation from a previous play, then
@@ -2968,6 +3013,7 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "fullscreen_act", None) is not None:
             self.fullscreen_act.setChecked(self.isFullScreen())
         self.stack.setCurrentWidget(self.grid_page)
+        self._update_page_arrows()
 
     # -------------------------------------------------------------- keyboard --
     def keyPressEvent(self, event):
@@ -2980,6 +3026,12 @@ class VideoGridApp(QMainWindow):
             self._seek_relative(-5000)        # back 5 seconds
         elif self.is_playing and key == Qt.Key.Key_Right:
             self._seek_relative(+5000)        # forward 5 seconds
+        elif (not self.is_playing and self.multi_page
+              and key == Qt.Key.Key_Left):
+            self._go_to_page(self.current_page - 1)
+        elif (not self.is_playing and self.multi_page
+              and key == Qt.Key.Key_Right):
+            self._go_to_page(self.current_page + 1)
         else:
             super().keyPressEvent(event)
 
@@ -3015,6 +3067,8 @@ class VideoGridApp(QMainWindow):
         if getattr(self, "overlay_toggle", None) is not None \
                 and self.overlay_toggle.isVisible():
             self._position_overlay_toggle()
+        if getattr(self, "prev_page_button", None) is not None:
+            self._position_page_arrows()
 
     # ------------------------------------------------------------------ misc --
     def _toggle_fullscreen(self, checked: bool | None = None) -> None:
