@@ -37,6 +37,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from translations import LANGUAGES, get_strings
+
 # Silence OpenCV's FFmpeg warning spam (e.g. "moov atom not found" that
 # appears on some Windows setups when reading MP4s with non-ASCII paths).
 # Must be set BEFORE cv2 is imported below to take effect.
@@ -688,11 +690,14 @@ class OpenFolderDialog(QDialog):
                  shuffle_default: bool = False,
                  thumbnail_resolution_default: str = DEFAULT_THUMB_RES,
                  chevron_hides_close_default: bool = True,
-                 last_folder_default: str = ""):
+                 last_folder_default: str = "",
+                 language_default: str = "en"):
         super().__init__(parent)
-        self.setWindowTitle("Open Videos")
-        self.setFixedSize(560, 565)
         self._last_folder_default: str = last_folder_default or ""
+        self.language: str = language_default
+        tr = get_strings(self.language)
+        self.setWindowTitle(tr["dialog_title"])
+        self.setFixedSize(560, 600)
         self.setStyleSheet("QDialog { background: #101010; }")
         self.chosen_folder: str | None = None
         self.show_titles: bool = show_titles_default
@@ -711,72 +716,25 @@ class OpenFolderDialog(QDialog):
         root.setContentsMargins(22, 18, 22, 16)
         root.setSpacing(0)
 
-        title = QLabel("Video Grid Player")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(
+        self._title_label = QLabel(tr["app_title"])
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setStyleSheet(
             "color: white; font-size: 18px; font-weight: bold;")
-        root.addWidget(title)
+        root.addWidget(self._title_label)
 
         root.addSpacing(7)
 
-        desc = QLabel(
-            "Select a folder containing your video files.\n"
-            "Your videos will be shown in the grid configured below.")
-        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet("color: #bbbbbb;")
-        root.addWidget(desc)
+        self._desc_label = QLabel(tr["app_desc"])
+        self._desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._desc_label.setStyleSheet("color: #bbbbbb;")
+        root.addWidget(self._desc_label)
 
         root.addSpacing(12)
 
-        # --- grid size controls ------------------------------------------
-        spin_style = (
-            "QSpinBox {"
-            "   background: #1a1a1a; color: white; "
-            "   border: 1px solid #444; border-radius: 3px; "
-            "   padding: 4px 6px; font-size: 12px; min-width: 56px;"
-            "}"
-            "QSpinBox::up-button, QSpinBox::down-button {"
-            "   background: #2a2a2a; border: none; width: 16px;"
-            "}"
-            "QSpinBox::up-button:hover, QSpinBox::down-button:hover {"
-            "   background: #3a3a3a;"
-            "}"
-        )
+        # --- shared styles -----------------------------------------------
         label_style = (
             "color: #dddddd; font-size: 12px; background: transparent;"
         )
-
-        grid_row = QHBoxLayout()
-        grid_row.addStretch(1)
-
-        rows_label = QLabel("Rows:")
-        rows_label.setStyleSheet(label_style)
-        grid_row.addWidget(rows_label)
-
-        self.rows_spin = QSpinBox()
-        self.rows_spin.setRange(1, MAX_GRID_DIM)
-        self.rows_spin.setValue(rows_default)
-        self.rows_spin.setStyleSheet(spin_style)
-        grid_row.addWidget(self.rows_spin)
-
-        grid_row.addSpacing(24)
-
-        cols_label = QLabel("Columns:")
-        cols_label.setStyleSheet(label_style)
-        grid_row.addWidget(cols_label)
-
-        self.cols_spin = QSpinBox()
-        self.cols_spin.setRange(1, MAX_GRID_DIM)
-        self.cols_spin.setValue(cols_default)
-        self.cols_spin.setStyleSheet(spin_style)
-        grid_row.addWidget(self.cols_spin)
-
-        grid_row.addStretch(1)
-        root.addLayout(grid_row)
-
-        root.addSpacing(10)
-
-        # --- thumbnail resolution ----------------------------------------
         combo_style = (
             "QComboBox {"
             "   background: #1a1a1a; color: white; "
@@ -792,16 +750,86 @@ class OpenFolderDialog(QDialog):
             "   border: 1px solid #444;"
             "}"
         )
+        spin_style = (
+            "QSpinBox {"
+            "   background: #1a1a1a; color: white; "
+            "   border: 1px solid #444; border-radius: 3px; "
+            "   padding: 4px 6px; font-size: 12px; min-width: 56px;"
+            "}"
+            "QSpinBox::up-button, QSpinBox::down-button {"
+            "   background: #2a2a2a; border: none; width: 16px;"
+            "}"
+            "QSpinBox::up-button:hover, QSpinBox::down-button:hover {"
+            "   background: #3a3a3a;"
+            "}"
+        )
+
+        # --- language selector -------------------------------------------
+        lang_row = QHBoxLayout()
+        lang_row.addStretch(1)
+        self._lang_label = QLabel(tr["language_label"])
+        self._lang_label.setStyleSheet(label_style)
+        lang_row.addWidget(self._lang_label)
+        self.lang_combo = QComboBox()
+        self.lang_combo.setStyleSheet(combo_style)
+        self.lang_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for code, name in LANGUAGES.items():
+            self.lang_combo.addItem(name, code)
+        lang_idx = self.lang_combo.findData(self.language)
+        self.lang_combo.setCurrentIndex(max(0, lang_idx))
+        lang_row.addWidget(self.lang_combo)
+        lang_row.addStretch(1)
+        root.addLayout(lang_row)
+        self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
+
+        root.addSpacing(10)
+
+        # --- grid size controls ------------------------------------------
+        grid_row = QHBoxLayout()
+        grid_row.addStretch(1)
+
+        self._rows_label = QLabel(tr["rows_label"])
+        self._rows_label.setStyleSheet(label_style)
+        grid_row.addWidget(self._rows_label)
+
+        self.rows_spin = QSpinBox()
+        self.rows_spin.setRange(1, MAX_GRID_DIM)
+        self.rows_spin.setValue(rows_default)
+        self.rows_spin.setStyleSheet(spin_style)
+        grid_row.addWidget(self.rows_spin)
+
+        grid_row.addSpacing(24)
+
+        self._cols_label = QLabel(tr["cols_label"])
+        self._cols_label.setStyleSheet(label_style)
+        grid_row.addWidget(self._cols_label)
+
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(1, MAX_GRID_DIM)
+        self.cols_spin.setValue(cols_default)
+        self.cols_spin.setStyleSheet(spin_style)
+        grid_row.addWidget(self.cols_spin)
+
+        grid_row.addStretch(1)
+        root.addLayout(grid_row)
+
+        root.addSpacing(10)
+
+        # --- thumbnail resolution ----------------------------------------
         res_row = QHBoxLayout()
         res_row.addStretch(1)
-        res_label = QLabel("Thumbnail quality:")
-        res_label.setStyleSheet(label_style)
-        res_row.addWidget(res_label)
+        self._res_label = QLabel(tr["thumb_quality_label"])
+        self._res_label.setStyleSheet(label_style)
+        res_row.addWidget(self._res_label)
         self.res_combo = QComboBox()
         self.res_combo.setStyleSheet(combo_style)
         self.res_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        for key in (THUMB_RES_STANDARD, THUMB_RES_HIGH, THUMB_RES_ULTRA):
-            self.res_combo.addItem(THUMB_RES_LABELS[key], key)
+        for key, tr_key in (
+            (THUMB_RES_STANDARD, "thumb_standard"),
+            (THUMB_RES_HIGH,     "thumb_high"),
+            (THUMB_RES_ULTRA,    "thumb_ultra"),
+        ):
+            self.res_combo.addItem(tr[tr_key], key)
         # Select the current default
         idx = self.res_combo.findData(thumbnail_resolution_default)
         if idx < 0:
@@ -827,7 +855,7 @@ class OpenFolderDialog(QDialog):
             "   image: none; }"
         )
 
-        self.titles_checkbox = QCheckBox("Show video titles in the grid")
+        self.titles_checkbox = QCheckBox(tr["show_titles"])
         self.titles_checkbox.setChecked(show_titles_default)
         self.titles_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.titles_checkbox.setStyleSheet(check_style)
@@ -836,8 +864,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.full_width_checkbox = QCheckBox(
-            "Full-width layout (no gaps between videos)")
+        self.full_width_checkbox = QCheckBox(tr["full_width"])
         self.full_width_checkbox.setChecked(full_width_default)
         self.full_width_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.full_width_checkbox.setStyleSheet(check_style)
@@ -846,9 +873,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.sidecar_checkbox = QCheckBox(
-            "Use matching image files as thumbnails "
-            "(e.g. video.jpg next to video.mp4)")
+        self.sidecar_checkbox = QCheckBox(tr["use_sidecar"])
         self.sidecar_checkbox.setChecked(use_sidecar_default)
         self.sidecar_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sidecar_checkbox.setStyleSheet(check_style)
@@ -857,9 +882,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.clip_thumb_checkbox = QCheckBox(
-            "Preserve thumbnail aspect ratio "
-            "(clip to fit instead of stretching)")
+        self.clip_thumb_checkbox = QCheckBox(tr["clip_thumb"])
         self.clip_thumb_checkbox.setChecked(
             thumbnail_fit_default == FIT_CLIP)
         self.clip_thumb_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -869,8 +892,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.set_thumb_button_checkbox = QCheckBox(
-            "Show \u201cSet Thumbnail\u201d button while a video is playing")
+        self.set_thumb_button_checkbox = QCheckBox(tr["show_set_thumb_btn"])
         self.set_thumb_button_checkbox.setChecked(show_set_thumb_default)
         self.set_thumb_button_checkbox.setCursor(
             Qt.CursorShape.PointingHandCursor)
@@ -880,8 +902,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.auto_hide_checkbox = QCheckBox(
-            "Auto-hide on-screen controls after 5 seconds of playback")
+        self.auto_hide_checkbox = QCheckBox(tr["auto_hide"])
         self.auto_hide_checkbox.setChecked(auto_hide_default)
         self.auto_hide_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.auto_hide_checkbox.setStyleSheet(check_style)
@@ -890,8 +911,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.chevron_hides_close_checkbox = QCheckBox(
-            "Chevron button also hides the close (✕) button")
+        self.chevron_hides_close_checkbox = QCheckBox(tr["chevron_hides_close"])
         self.chevron_hides_close_checkbox.setChecked(
             chevron_hides_close_default)
         self.chevron_hides_close_checkbox.setCursor(
@@ -902,8 +922,7 @@ class OpenFolderDialog(QDialog):
 
         root.addSpacing(7)
 
-        self.shuffle_checkbox = QCheckBox(
-            "Shuffle \u2014 play a random video when the current one ends")
+        self.shuffle_checkbox = QCheckBox(tr["shuffle"])
         self.shuffle_checkbox.setChecked(shuffle_default)
         self.shuffle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.shuffle_checkbox.setStyleSheet(check_style)
@@ -916,21 +935,21 @@ class OpenFolderDialog(QDialog):
         row = QHBoxLayout()
         row.addStretch(1)
 
-        choose = QPushButton("Choose Folder…")
-        choose.setDefault(True)
-        choose.setStyleSheet(
+        self._choose_button = QPushButton(tr["choose_folder"])
+        self._choose_button.setDefault(True)
+        self._choose_button.setStyleSheet(
             "QPushButton { background: #2b5fa1; color: white; "
             "              font-weight: bold; padding: 9px 20px; "
             "              border: none; border-radius: 4px; }"
             "QPushButton:hover  { background: #3b7ec9; }"
             "QPushButton:pressed{ background: #24528b; }")
-        choose.clicked.connect(self._choose_folder)
-        row.addWidget(choose)
+        self._choose_button.clicked.connect(self._choose_folder)
+        row.addWidget(self._choose_button)
 
         # Reopens the most recently used folder without invoking the file
         # picker. Disabled when no previous folder has been recorded yet
         # or when the saved folder no longer exists on disk.
-        self.reopen_button = QPushButton("Open Last Folder")
+        self.reopen_button = QPushButton(tr["open_last"])
         self.reopen_button.setStyleSheet(
             "QPushButton { background: #444444; color: white; "
             "              padding: 9px 20px; border: none; "
@@ -944,25 +963,65 @@ class OpenFolderDialog(QDialog):
         self.reopen_button.setEnabled(last_ok)
         if last_ok:
             self.reopen_button.setToolTip(
-                "Reopen " + self._last_folder_default)
+                tr["reopen_tip"].format(folder=self._last_folder_default))
         else:
             self.reopen_button.setToolTip(
-                "No previous folder is available yet — "
-                "use “Choose Folder…” first.")
+                tr["no_last_folder_tip"])
         self.reopen_button.clicked.connect(self._reopen_last_folder)
         row.addWidget(self.reopen_button)
 
-        cancel = QPushButton("Cancel")
-        cancel.setStyleSheet(
+        self._cancel_button = QPushButton(tr["cancel"])
+        self._cancel_button.setStyleSheet(
             "QPushButton { background: #333333; color: white; "
             "              padding: 9px 20px; border: none; "
             "              border-radius: 4px; }"
             "QPushButton:hover { background: #444444; }")
-        cancel.clicked.connect(self.reject)
-        row.addWidget(cancel)
+        self._cancel_button.clicked.connect(self.reject)
+        row.addWidget(self._cancel_button)
 
         row.addStretch(1)
         root.addLayout(row)
+
+    def _on_language_changed(self) -> None:
+        code = self.lang_combo.currentData()
+        if code and code != self.language:
+            self.language = code
+            self._retranslate()
+
+    def _retranslate(self) -> None:
+        """Update every translatable widget text to the current language."""
+        tr = get_strings(self.language)
+        self.setWindowTitle(tr["dialog_title"])
+        self._title_label.setText(tr["app_title"])
+        self._desc_label.setText(tr["app_desc"])
+        self._lang_label.setText(tr["language_label"])
+        self._rows_label.setText(tr["rows_label"])
+        self._cols_label.setText(tr["cols_label"])
+        self._res_label.setText(tr["thumb_quality_label"])
+        # Res combo items (labels change, data keys stay)
+        for i, tr_key in enumerate(("thumb_standard", "thumb_high", "thumb_ultra")):
+            self.res_combo.setItemText(i, tr[tr_key])
+        # Checkboxes
+        self.titles_checkbox.setText(tr["show_titles"])
+        self.full_width_checkbox.setText(tr["full_width"])
+        self.sidecar_checkbox.setText(tr["use_sidecar"])
+        self.clip_thumb_checkbox.setText(tr["clip_thumb"])
+        self.set_thumb_button_checkbox.setText(tr["show_set_thumb_btn"])
+        self.auto_hide_checkbox.setText(tr["auto_hide"])
+        self.chevron_hides_close_checkbox.setText(tr["chevron_hides_close"])
+        self.shuffle_checkbox.setText(tr["shuffle"])
+        # Buttons
+        self._choose_button.setText(tr["choose_folder"])
+        self.reopen_button.setText(tr["open_last"])
+        self._cancel_button.setText(tr["cancel"])
+        # Reopen tooltip
+        last_ok = bool(self._last_folder_default) and os.path.isdir(
+            self._last_folder_default)
+        if last_ok:
+            self.reopen_button.setToolTip(
+                tr["reopen_tip"].format(folder=self._last_folder_default))
+        else:
+            self.reopen_button.setToolTip(tr["no_last_folder_tip"])
 
     def _commit_widget_values(self) -> None:
         """Pull the current state of every option widget into this
@@ -986,6 +1045,9 @@ class OpenFolderDialog(QDialog):
         res_key = self.res_combo.currentData()
         if res_key in THUMB_RESOLUTIONS:
             self.thumbnail_resolution = res_key
+        lang_key = self.lang_combo.currentData()
+        if lang_key in LANGUAGES:
+            self.language = lang_key
 
     def _choose_folder(self) -> None:
         # Default the OS picker to the last folder we used, if it still
@@ -1080,6 +1142,7 @@ class VideoGridApp(QMainWindow):
         self.thumbnail_resolution: str = DEFAULT_THUMB_RES  # decoded thumb size
         self.chevron_hides_close_button: bool = True  # ✕ vanishes on collapse?
         self.last_folder: str = ""  # most recent folder loaded; "" if none yet
+        self.language: str = "en"  # UI language code
         # Remembered window state across a play→stop cycle. Populated in
         # _play_video_at so we can restore the pre-playback window state
         # (fullscreen / maximized / normal) when playback ends.
@@ -1118,30 +1181,37 @@ class VideoGridApp(QMainWindow):
     def _build_menu(self) -> None:
         menu = self.menuBar()
 
-        file_menu = menu.addMenu("&File")
-        open_act = QAction("Open Folder…", self)
-        open_act.setShortcut(QKeySequence.StandardKey.Open)
-        open_act.triggered.connect(self._show_open_dialog)
-        file_menu.addAction(open_act)
-        file_menu.addSeparator()
+        self._file_menu = menu.addMenu(self._tr("menu_file"))
+        self._open_act = QAction(self._tr("menu_open_folder"), self)
+        self._open_act.setShortcut(QKeySequence.StandardKey.Open)
+        self._open_act.triggered.connect(self._show_open_dialog)
+        self._file_menu.addAction(self._open_act)
+        self._file_menu.addSeparator()
         # Full Screen toggle. Checkable so the menu reflects the current
         # state. Uses the platform standard shortcut (F11 on Windows/Linux,
         # Ctrl+Cmd+F on macOS).
-        self.fullscreen_act = QAction("Full Screen", self)
+        self.fullscreen_act = QAction(self._tr("menu_fullscreen"), self)
         self.fullscreen_act.setCheckable(True)
         self.fullscreen_act.setShortcut(QKeySequence.StandardKey.FullScreen)
         self.fullscreen_act.triggered.connect(self._toggle_fullscreen)
-        file_menu.addAction(self.fullscreen_act)
-        file_menu.addSeparator()
-        exit_act = QAction("Exit", self)
-        exit_act.setShortcut(QKeySequence.StandardKey.Quit)
-        exit_act.triggered.connect(self.close)
-        file_menu.addAction(exit_act)
+        self._file_menu.addAction(self.fullscreen_act)
+        self._file_menu.addSeparator()
+        self._exit_act = QAction(self._tr("menu_quit"), self)
+        self._exit_act.setShortcut(QKeySequence.StandardKey.Quit)
+        self._exit_act.triggered.connect(self.close)
+        self._file_menu.addAction(self._exit_act)
 
         help_menu = menu.addMenu("&Help")
         about_act = QAction("About", self)
         about_act.triggered.connect(self._show_about)
         help_menu.addAction(about_act)
+
+    def _retranslate_menu(self) -> None:
+        """Update menu item text to the current language."""
+        self._file_menu.setTitle(self._tr("menu_file"))
+        self._open_act.setText(self._tr("menu_open_folder"))
+        self.fullscreen_act.setText(self._tr("menu_fullscreen"))
+        self._exit_act.setText(self._tr("menu_quit"))
 
     def _build_grid_page(self) -> None:
         self.grid_page = QWidget()
@@ -1352,7 +1422,7 @@ class VideoGridApp(QMainWindow):
         self.close_button.setObjectName("closeOverlay")
         self.close_button.setFixedSize(48, 48)
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_button.setToolTip("Close video and return to grid (Esc)")
+        self.close_button.setToolTip(self._tr("close_tip"))
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._promote_to_overlay_window(self.close_button)
         self.close_button.setStyleSheet(
@@ -1397,8 +1467,7 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.setIcon(_make_camera_icon(26))
         self.set_thumb_button.setIconSize(QSize(26, 26))
         self.set_thumb_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.set_thumb_button.setToolTip(
-            "Use the current frame as this video's grid thumbnail")
+        self.set_thumb_button.setToolTip(self._tr("thumb_tip"))
         self.set_thumb_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._promote_to_overlay_window(self.set_thumb_button)
         self.set_thumb_button.setStyleSheet(
@@ -1444,7 +1513,7 @@ class VideoGridApp(QMainWindow):
         self.loop_button.setIcon(_make_loop_icon(24))
         self.loop_button.setIconSize(QSize(24, 24))
         self.loop_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.loop_button.setToolTip("Loop: off  —  click to enable")
+        self.loop_button.setToolTip(self._tr("loop_off_tip"))
         self.loop_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._promote_to_overlay_window(self.loop_button)
         self._apply_loop_button_style()
@@ -1487,8 +1556,9 @@ class VideoGridApp(QMainWindow):
     def _toggle_loop(self) -> None:
         self.loop_active = not self.loop_active
         self._apply_loop_button_style()
-        state = "on" if self.loop_active else "off"
-        self.loop_button.setToolTip(f"Loop: {state}  —  click to toggle")
+        state = self._tr("loop_on") if self.loop_active else self._tr("loop_off")
+        self.loop_button.setToolTip(
+            self._tr("loop_tip_fmt").format(state=state))
 
     def _position_loop_button(self) -> None:
         """Pin the loop button just to the left of the camera button (or the
@@ -1638,7 +1708,7 @@ class VideoGridApp(QMainWindow):
         self.overlay_toggle.setFixedSize(56, 28)
         self.overlay_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.overlay_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self.overlay_toggle.setToolTip(self._tr("hide_controls_tip"))
         self._promote_to_overlay_window(self.overlay_toggle)
         self.overlay_toggle.setStyleSheet(
             "#overlayToggle {"
@@ -1715,7 +1785,7 @@ class VideoGridApp(QMainWindow):
         self.set_thumb_button.hide()
         self.loop_button.hide()
         self.overlay_toggle.setText("\u25B4")       # ▴
-        self.overlay_toggle.setToolTip("Show on-screen controls")
+        self.overlay_toggle.setToolTip(self._tr("show_controls_tip"))
         # Chevron is now on its own at the bottom — reposition accordingly.
         self._position_overlay_toggle()
         self.auto_hide_timer.stop()
@@ -1738,7 +1808,7 @@ class VideoGridApp(QMainWindow):
         self.jog_bar.show()
         self.jog_bar.raise_()
         self.overlay_toggle.setText("\u25BE")       # ▾
-        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self.overlay_toggle.setToolTip(self._tr("hide_controls_tip"))
         self._position_overlay_toggle()
 
     def _auto_hide_fire(self) -> None:
@@ -1823,12 +1893,17 @@ class VideoGridApp(QMainWindow):
         ("thumbnail_resolution", str, DEFAULT_THUMB_RES),
         ("chevron_hides_close_button", bool, True),
         ("last_folder", str, ""),
+        ("language", str, "en"),
     )
 
     def _settings(self) -> "QSettings":
         """QSettings handle bound to the per-user store. Org/app names
         are set in main() so this is the same store across sessions."""
         return QSettings()
+
+    def _tr(self, key: str) -> str:
+        """Return the translated string for *key* in the current language."""
+        return get_strings(self.language).get(key, key)
 
     @staticmethod
     def _coerce(value, value_type, fallback):
@@ -1921,6 +1996,7 @@ class VideoGridApp(QMainWindow):
             thumbnail_resolution_default=self.thumbnail_resolution,
             chevron_hides_close_default=self.chevron_hides_close_button,
             last_folder_default=self.last_folder,
+            language_default=self.language,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.chosen_folder:
             self.show_titles = dlg.show_titles
@@ -1934,6 +2010,8 @@ class VideoGridApp(QMainWindow):
             self.shuffle_play = dlg.shuffle_play
             self.thumbnail_resolution = dlg.thumbnail_resolution
             self.chevron_hides_close_button = dlg.chevron_hides_close_button
+            self.language = dlg.language
+            self._retranslate_menu()
             # Persist these choices so the next run remembers them.
             self._save_preferences()
             self._load_folder(dlg.chosen_folder)
@@ -1942,8 +2020,9 @@ class VideoGridApp(QMainWindow):
         try:
             entries = sorted(os.listdir(folder))
         except OSError as exc:
-            QMessageBox.critical(self, "Error",
-                                 f"Could not read folder:\n{exc}")
+            QMessageBox.critical(
+                self, self._tr("folder_error_title"),
+                self._tr("folder_error_msg").format(error=exc))
             return
 
         videos = [
@@ -1954,9 +2033,8 @@ class VideoGridApp(QMainWindow):
         ]
         if not videos:
             QMessageBox.warning(
-                self, "No videos",
-                "No supported video files were found in that folder.\n\n"
-                "Supported extensions: " + ", ".join(VIDEO_EXTS))
+                self, self._tr("no_videos_title"),
+                self._tr("no_videos_msg").format(exts=", ".join(VIDEO_EXTS)))
             return
 
         self.video_files = videos[:self.grid_rows * self.grid_cols]
@@ -2279,7 +2357,7 @@ class VideoGridApp(QMainWindow):
         # chevron to its "press to hide" state and show it under the bar.
         self._overlays_hidden = False
         self.overlay_toggle.setText("\u25BE")     # ▾
-        self.overlay_toggle.setToolTip("Hide on-screen controls")
+        self.overlay_toggle.setToolTip(self._tr("hide_controls_tip"))
         self._position_overlay_toggle()
         self.overlay_toggle.show()
 
