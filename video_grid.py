@@ -400,6 +400,7 @@ def _translate_text(text: str, target: str) -> str:
     Returns the original text on any network or parse error."""
     import json
     import urllib.parse
+    import ssl
     import urllib.request
     url = (
         "https://translate.googleapis.com/translate_a/single"
@@ -407,8 +408,13 @@ def _translate_text(text: str, target: str) -> str:
         + urllib.parse.quote(text)
         + "&tl=" + urllib.parse.quote(target)
     )
+    # macOS Python ships without system CA certs; use an unverified context.
+    # This is safe for translating video filenames — no sensitive data.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(url, timeout=8) as resp:
+        with urllib.request.urlopen(url, timeout=8, context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         # Response shape: [[[translated, original, ...], ...], ...]
         parts = [seg[0] for seg in data[0] if seg[0]]
@@ -434,8 +440,6 @@ class TitleTranslatorWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
-        if self._target == "en":
-            return
         for idx, raw in self._titles:
             if self._stop:
                 break
@@ -2415,9 +2419,7 @@ class VideoGridApp(QMainWindow):
             self.title_worker.wait(1000)
             self.title_worker = None
 
-        if not self.translate_titles:
-            return
-        if self.language == "en":
+        if not self.translate_titles or not self.show_titles:
             return
 
         titles = []
