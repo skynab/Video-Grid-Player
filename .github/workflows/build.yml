@@ -60,13 +60,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION=$(python - <<'EOF'
-          import re, sys
-          src = open("video_grid.py").read()
-          m = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', src, re.M)
-          print(m.group(1) if m else "0.0.0")
-          EOF
-          )
+          VERSION=$(grep -m 1 '^APP_VERSION' video_grid.py | cut -d'"' -f2)
           echo "APP_VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Detected app version: ${VERSION}"
 
