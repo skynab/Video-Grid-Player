@@ -19,7 +19,7 @@ name: Build distributables
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags:     ["v*.*.*"]
 
 permissions:
