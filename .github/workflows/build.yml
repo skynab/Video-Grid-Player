@@ -22,6 +22,9 @@ on:
     branches: ["**"]
     tags:     ["v*.*.*"]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write   # needed to create releases and upload assets
 
@@ -116,7 +119,7 @@ jobs:
         id: win_artifact
         shell: bash
         run: |
-          NAME="VideoGridPlayer-Setup-${{ steps.version.outputs.APP_VERSION }}.exe"
+          NAME="VideoGridPlayer-Windows-Setup-${{ steps.version.outputs.APP_VERSION }}.exe"
           echo "ARTIFACT_PATH=installer/${NAME}" >> "$GITHUB_OUTPUT"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_OUTPUT"
 
@@ -147,7 +150,7 @@ jobs:
         id: linux_artifact
         shell: bash
         run: |
-          NAME="videogridplayer_${{ steps.version.outputs.APP_VERSION }}_amd64.deb"
+          NAME="VideoGridPlayer-Linux-${{ steps.version.outputs.APP_VERSION }}_amd64.deb"
           echo "ARTIFACT_PATH=${NAME}" >> "$GITHUB_OUTPUT"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_OUTPUT"
 

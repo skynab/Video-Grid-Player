@@ -17,7 +17,7 @@ set -euo pipefail
 VERSION="${1:-1.2.0}"
 ARCH="amd64"
 PACKAGE="videogridplayer"
-DEB_NAME="${PACKAGE}_${VERSION}_${ARCH}.deb"
+DEB_NAME="VideoGridPlayer-Linux-${VERSION}_${ARCH}.deb"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -81,4 +81,5 @@ dpkg-deb --build --root-owner-group "${STAGING}" "${PROJECT_ROOT}/${DEB_NAME}"
 echo "==> Created: ${PROJECT_ROOT}/${DEB_NAME}"
 echo ""
 echo "Install with:   sudo dpkg -i ${DEB_NAME}"
+
 echo "Remove with:    sudo apt remove ${PACKAGE}"

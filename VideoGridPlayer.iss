@@ -39,7 +39,7 @@ AllowNoIcons=yes
 
 ; ---- Output ----
 OutputDir=installer
-OutputBaseFilename=VideoGridPlayer-Setup-{#AppVersion}
+OutputBaseFilename=VideoGridPlayer-Windows-Setup-{#AppVersion}
 
 ; ---- Compression ----
 Compression=lzma2/ultra64
