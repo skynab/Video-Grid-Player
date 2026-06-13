@@ -1,0 +1,12 @@
+Package: videogridplayer
+Version: 1.2.0
+Architecture: amd64
+Maintainer: Video Grid Player <noreply@example.com>
+Section: video
+Priority: optional
+Description: Video Grid Player
+ A cross-platform desktop application that displays video thumbnails
+ in a configurable grid and plays them fullscreen via VLC.
+ .
+ Features include multi-page navigation, multilingual UI, thumbnail
+ customisation, shuffle playback, and video title translation.

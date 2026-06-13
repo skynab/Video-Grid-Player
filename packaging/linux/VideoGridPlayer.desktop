@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Video Grid Player
+GenericName=Video Player
+Comment=Play multiple videos in a resizable grid
+Exec=/usr/share/VideoGridPlayer/VideoGridPlayer
+Icon=videogridplayer
+Categories=AudioVideo;Video;Player;
+Terminal=false
+StartupNotify=true
+StartupWMClass=VideoGridPlayer

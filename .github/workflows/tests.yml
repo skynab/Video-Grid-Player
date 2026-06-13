@@ -31,10 +31,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          # No `cache: pip` — that option requires a requirements.txt or
-          # pyproject.toml in the repo to hash for the cache key, and
-          # we don't ship one. The install step is fast enough without
-          # caching that the speedup wouldn't justify the extra file.
+          cache: pip
 
       # PyQt6 needs a handful of X libs to import on a headless Linux
       # runner even with QT_QPA_PLATFORM=offscreen. macOS and Windows

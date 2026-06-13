@@ -1,0 +1,199 @@
+name: Build distributables
+
+# Runs on every push to main (produces dev artifacts) and whenever a version
+# tag is pushed (produces a GitHub Release with downloadable assets).
+#
+# Version tags must match the pattern v*.*.* (e.g. v1.2.0, v1.3.0-beta).
+# Create a release like this:
+#
+#   git tag v1.2.0
+#   git push origin v1.2.0
+#
+# GitHub Actions will build all three platforms and attach the outputs to
+# a new draft GitHub Release automatically.
+#
+# Output artifacts:
+#   Windows  →  VideoGridPlayer-Setup-1.2.0.exe   (Inno Setup installer)
+#   macOS    →  VideoGridPlayer-macos.zip          (drag-to-Applications zip)
+#   Linux    →  videogridplayer_1.2.0_amd64.deb   (Debian/Ubuntu package)
+
+on:
+  push:
+    branches: [main]
+    tags:     ["v*.*.*"]
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+jobs:
+  build:
+    name: Build / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_label: Windows
+          - os: macos-latest
+            asset_label: macOS
+          - os: ubuntu-latest
+            asset_label: Linux
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # -----------------------------------------------------------------------
+      # Extract the app version from video_grid.py so every artifact name
+      # and installer is stamped with the same version automatically.
+      # -----------------------------------------------------------------------
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python - <<'EOF'
+          import re, sys
+          src = open("video_grid.py").read()
+          m = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', src, re.M)
+          print(m.group(1) if m else "0.0.0")
+          EOF
+          )
+          echo "APP_VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected app version: ${VERSION}"
+
+      # -----------------------------------------------------------------------
+      # Platform-specific system dependencies
+      # -----------------------------------------------------------------------
+      - name: Install Qt + VLC system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            vlc libvlc-dev \
+            libegl1 libgl1 libglib2.0-0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libdbus-1-3
+
+      - name: Install VLC (macOS)
+        if: runner.os == 'macOS'
+        run: brew install --cask vlc
+
+      - name: Install VLC (Windows)
+        if: runner.os == 'Windows'
+        run: choco install vlc --yes --no-progress
+
+      # -----------------------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # -----------------------------------------------------------------------
+      - name: Build with PyInstaller
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pyinstaller VideoGridPlayer.spec
+
+      # -----------------------------------------------------------------------
+      # Windows — wrap with Inno Setup to produce a click-to-install .exe
+      # -----------------------------------------------------------------------
+      - name: Install Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        run: iscc VideoGridPlayer.iss
+        # Output: installer\VideoGridPlayer-Setup-<version>.exe
+
+      - name: Set Windows artifact path
+        if: runner.os == 'Windows'
+        id: win_artifact
+        shell: bash
+        run: |
+          NAME="VideoGridPlayer-Setup-${{ steps.version.outputs.APP_VERSION }}.exe"
+          echo "ARTIFACT_PATH=installer/${NAME}" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # macOS — zip the .app bundle (no installer needed; drag to /Applications)
+      # -----------------------------------------------------------------------
+      - name: Zip app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: zip -r VideoGridPlayer-macos.zip dist/VideoGridPlayer.app
+
+      - name: Set macOS artifact path
+        if: runner.os == 'macOS'
+        id: mac_artifact
+        shell: bash
+        run: |
+          echo "ARTIFACT_PATH=VideoGridPlayer-macos.zip" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=VideoGridPlayer-macos.zip"  >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Linux — build a .deb so users can double-click or apt install it
+      # -----------------------------------------------------------------------
+      - name: Build .deb package (Linux)
+        if: runner.os == 'Linux'
+        run: bash packaging/linux/build_deb.sh "${{ steps.version.outputs.APP_VERSION }}"
+
+      - name: Set Linux artifact path
+        if: runner.os == 'Linux'
+        id: linux_artifact
+        shell: bash
+        run: |
+          NAME="videogridplayer_${{ steps.version.outputs.APP_VERSION }}_amd64.deb"
+          echo "ARTIFACT_PATH=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Resolve the artifact path/name into a single output for the steps below
+      # -----------------------------------------------------------------------
+      - name: Resolve artifact info
+        id: artifact
+        shell: bash
+        run: |
+          if   [ "${{ runner.os }}" = "Windows" ]; then
+            echo "PATH=${{ steps.win_artifact.outputs.ARTIFACT_PATH }}"   >> "$GITHUB_OUTPUT"
+            echo "NAME=${{ steps.win_artifact.outputs.ARTIFACT_NAME }}"   >> "$GITHUB_OUTPUT"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            echo "PATH=${{ steps.mac_artifact.outputs.ARTIFACT_PATH }}"   >> "$GITHUB_OUTPUT"
+            echo "NAME=${{ steps.mac_artifact.outputs.ARTIFACT_NAME }}"   >> "$GITHUB_OUTPUT"
+          else
+            echo "PATH=${{ steps.linux_artifact.outputs.ARTIFACT_PATH }}" >> "$GITHUB_OUTPUT"
+            echo "NAME=${{ steps.linux_artifact.outputs.ARTIFACT_NAME }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Upload as a workflow artifact (available from the Actions tab on every
+      # build, retained for 30 days regardless of whether it is a release).
+      # -----------------------------------------------------------------------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.NAME }}
+          path: ${{ steps.artifact.outputs.PATH }}
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # On version tags only: attach to a GitHub Release (created if needed).
+      # The release is drafted so you can add release notes before publishing.
+      # -----------------------------------------------------------------------
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.artifact.outputs.PATH }}
+          draft: true
+          generate_release_notes: true
