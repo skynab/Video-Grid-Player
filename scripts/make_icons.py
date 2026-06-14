@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-make_icons.py — generate platform icon assets from assets/icon.svg.
+make_icons.py — generate platform icon assets from SVG sources.
+
+Sources:
+  assets/icon.svg            → app icon (all platforms)
+  assets/icon-installer.svg  → Windows installer wizard icon (contains embedded PNG)
 
 Outputs:
-  assets/icon.png        256×256  (Linux .desktop + fallback)
-  assets/icon.ico        multi-resolution (Windows)
-  assets/icon.iconset/   macOS iconset folder
-  assets/icon.icns       macOS app icon  (requires macOS iconutil)
+  assets/icon.png            256×256  (Linux .desktop + fallback)
+  assets/icon.ico            multi-resolution (Windows app icon)
+  assets/icon.icns           macOS app icon  (requires macOS iconutil)
+  assets/icon.iconset/       macOS iconset folder
+  assets/icon-installer.ico  multi-resolution (Windows Inno Setup wizard icon)
 
 Run from the project root:
   python scripts/make_icons.py
@@ -123,5 +128,31 @@ if sys.platform == "darwin":
 else:
     print("NOTE: icon.icns skipped (requires macOS iconutil). Copy iconset to a Mac and run:")
     print("  iconutil -c icns assets/icon.iconset -o assets/icon.icns")
+
+# ── assets/icon-installer.ico (Windows Inno Setup wizard icon) ───────────────
+# The installer SVG contains an embedded raster PNG — extract and convert it.
+installer_svg = ASSETS / "icon-installer.svg"
+if installer_svg.exists():
+    import base64, re as _re
+    svg_text = installer_svg.read_text(encoding="utf-8")
+    m = _re.search(r'data:image/png;base64,([A-Za-z0-9+/=]+)', svg_text)
+    if m:
+        raw_bytes = base64.b64decode(m.group(1))
+        raw_img   = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+        side      = max(raw_img.size)
+        square    = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        square.paste(raw_img, ((side - raw_img.width) // 2,
+                               (side - raw_img.height) // 2))
+        master_installer = square.resize((512, 512), Image.LANCZOS)
+        master_installer.save(
+            ASSETS / "icon-installer.ico",
+            format="ICO",
+            sizes=[(s, s) for s in ICO_SIZES],
+        )
+        print("✓ assets/icon-installer.ico")
+    else:
+        print("WARNING: no embedded PNG found in icon-installer.svg — skipping")
+else:
+    print("NOTE: assets/icon-installer.svg not found — skipping installer icon")
 
 print("\nDone. Commit the assets/ directory.")

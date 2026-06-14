@@ -47,7 +47,7 @@ SolidCompression=yes
 
 ; ---- UI ----
 WizardStyle=modern
-SetupIconFile=assets\icon.ico
+SetupIconFile=assets\icon-installer.ico
 WizardImageFile=compiler:WizModernImage.bmp
 WizardSmallImageFile=compiler:WizModernSmallImage.bmp
 
