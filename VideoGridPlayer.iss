@@ -47,6 +47,9 @@ SolidCompression=yes
 
 ; ---- UI ----
 WizardStyle=modern
+SetupIconFile=assets\icon.ico
+WizardImageFile=compiler:WizModernImage.bmp
+WizardSmallImageFile=compiler:WizModernSmallImage.bmp
 
 ; ---- Misc ----
 ; Require Windows 10 or newer

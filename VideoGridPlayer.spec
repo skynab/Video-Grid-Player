@@ -77,6 +77,13 @@ def collect_vlc_binaries() -> list[tuple[str, str]]:
 
     print(f"Bundling VLC libraries from: {vlc_dir}")
 
+    # plugins.dat is VLC's plugin cache — it records file timestamps from the
+    # build machine.  When the bundle is copied to a different machine the
+    # timestamps no longer match and VLC prints "stale plugins cache" errors
+    # and refuses to load plugins.  Excluding it forces VLC to scan the
+    # plugins/ directory on first launch and build a fresh cache.
+    _vlc_skip = {"plugins.dat"}
+
     if sys.platform == "win32":
         # On Windows, libvlc.dll and libvlccore.dll live directly in the VLC
         # install folder alongside a plugins/ subdirectory.
@@ -85,7 +92,7 @@ def collect_vlc_binaries() -> list[tuple[str, str]]:
         plugins_dir = vlc_dir / "plugins"
         if plugins_dir.exists():
             for f in plugins_dir.rglob("*"):
-                if f.is_file():
+                if f.is_file() and f.name not in _vlc_skip:
                     rel = f.relative_to(vlc_dir)
                     binaries.append((str(f), str(rel.parent)))
 
@@ -99,7 +106,7 @@ def collect_vlc_binaries() -> list[tuple[str, str]]:
             plugins_dir = vlc_dir.parent / "plugins"
         if plugins_dir.exists():
             for f in plugins_dir.rglob("*"):
-                if f.is_file():
+                if f.is_file() and f.name not in _vlc_skip:
                     rel = f.relative_to(plugins_dir.parent)
                     binaries.append((str(f), str(Path("lib") / rel.parent)))
 
@@ -114,7 +121,7 @@ def collect_vlc_binaries() -> list[tuple[str, str]]:
         ]:
             if plugin_root.exists():
                 for f in plugin_root.rglob("*"):
-                    if f.is_file():
+                    if f.is_file() and f.name not in _vlc_skip:
                         rel = f.relative_to(plugin_root.parent.parent)
                         binaries.append((str(f), str(rel.parent)))
                 break
@@ -128,6 +135,9 @@ def collect_vlc_binaries() -> list[tuple[str, str]]:
 added_datas = [
     # translations.py must travel with the app
     ("translations.py", "."),
+    # Icon assets (used by the window manager / taskbar on some platforms)
+    ("assets/icon.png", "assets"),
+    ("assets/icon.ico", "assets"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -189,7 +199,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="assets/icon.ico",   # uncomment and point at an .ico / .icns file
+    icon="assets/icon.ico" if sys.platform == "win32" else "assets/icon.icns",
 )
 
 coll = COLLECT(
@@ -207,7 +217,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="VideoGridPlayer.app",
-        # icon="assets/icon.icns",   # uncomment and point at an .icns file
+        icon="assets/icon.icns",
         bundle_identifier="com.videogridplayer.app",
         info_plist={
             "CFBundleShortVersionString": "1.2.0",

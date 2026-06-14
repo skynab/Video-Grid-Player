@@ -46,11 +46,21 @@ mkdir -p "${STAGING}/DEBIAN"
 mkdir -p "${STAGING}/usr/share/VideoGridPlayer"
 mkdir -p "${STAGING}/usr/bin"
 mkdir -p "${STAGING}/usr/share/applications"
+mkdir -p "${STAGING}/usr/share/pixmaps"
+
+# App icon
+cp "${PROJECT_ROOT}/assets/icon.png" \
+   "${STAGING}/usr/share/pixmaps/videogridplayer.png"
 
 # ---------------------------------------------------------------------------
 # Copy PyInstaller output
 cp -r "${DIST_DIR}/." "${STAGING}/usr/share/VideoGridPlayer/"
 chmod +x "${STAGING}/usr/share/VideoGridPlayer/VideoGridPlayer"
+
+# Remove the VLC plugin cache — it records build-machine timestamps and will
+# cause "stale plugins cache" errors on any other machine.  VLC rescans and
+# rebuilds the cache automatically on first launch.
+find "${STAGING}/usr/share/VideoGridPlayer" -name "plugins.dat" -delete
 
 # ---------------------------------------------------------------------------
 # Thin shell launcher in /usr/bin
